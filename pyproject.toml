@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ascend310p-rgdr-patch"
+version = "0.1.0"
+description = "Opt-in grouped RGDR for vLLM Ascend 0.23.0 on Ascend310P3"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+
+[project.entry-points."vllm.general_plugins"]
+ascend310p_grouped_rgdr = "ascend310p_rgdr_patch:register"
+
+[tool.setuptools.packages.find]
+where = ["src"]
