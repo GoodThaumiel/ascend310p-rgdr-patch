@@ -1,6 +1,6 @@
 # vLLM Ascend 0.23.0 的 grouped RGDR monkey patch
 
-适用于已有 vLLM 0.23.0、vLLM Ascend 0.23.0 的 Ascend310P3 镜像。目标形状为每 rank
+适用于 vLLM 0.23.0 与 vLLM Ascend 0.23.0 或 0.23.0rc1 搭配的 Ascend310P3 镜像。目标形状为每 rank
 8 个 Q/K head、16 个 value head、K=V=128，使用 FP16 SSM cache。例如该形状的
 Qwen 35B-A3B W8A8 TP2。默认只替换普通 GDN decode 的 recurrent 算子。
 可选 `ASCEND310P_RGDR_PATCH_MODE=spec` 启用投机路径，或 `both` 启用两条路径。
@@ -19,6 +19,10 @@ git clone git@github.com:GoodThaumiel/ascend310p-rgdr-patch.git
 cd ascend310p-rgdr-patch
 python3 -m pip install --no-deps .
 ```
+
+已安装插件时，在仓库根目录执行 `git pull --ff-only`，再运行
+`python3 -m pip install --no-deps --upgrade .`。0.1.1 的 rc1 兼容修复可以复用
+同一镜像里已编译的 RGDR `.so`。
 
 ## 2. 构建并启用算子
 

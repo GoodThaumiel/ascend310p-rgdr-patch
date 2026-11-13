@@ -82,6 +82,11 @@ class TestRegistration(unittest.TestCase):
             load.assert_not_called()
 
     def test_loaded_once_and_only_replaces_helper(self):
+        for ascend_version in ("0.23.0+local", "0.23.0rc1", "0.23.0rc1+local"):
+            with self.subTest(ascend_version=ascend_version):
+                self._check_registration(ascend_version)
+
+    def _check_registration(self, ascend_version):
         source = f"def {plugin._HELPER}({', '.join(plugin._PARAMETERS)}): pass"
         module = SimpleNamespace(l2norm_310p=Mock())
         ns = {}
@@ -93,7 +98,7 @@ class TestRegistration(unittest.TestCase):
         with (
             TemporaryDirectory() as directory,
             patch.object(plugin, "import_module", return_value=module),
-            patch.object(plugin, "version", return_value="0.23.0+local"),
+            patch.object(plugin, "version", side_effect={"vllm": "0.23.0", "vllm-ascend": ascend_version}.__getitem__),
             patch.dict("sys.modules", {"vllm_ascend.utils": SimpleNamespace(is_310p=lambda: True)}),
             patch.object(torch.ops, "load_library") as load,
             patch.object(torch.ops.rgdr_v310_cube_fp16, "run_", grouped, create=True),
@@ -107,3 +112,15 @@ class TestRegistration(unittest.TestCase):
             load.assert_called_once_with(str(library))
         self.assertIsNot(wrapped, original)
         self.assertIs(wrapped, getattr(module, plugin._HELPER))
+
+    def test_other_releases_are_rejected(self):
+        for ascend_version in ("0.23.0rc10", "0.23.0rc2", "0.23.1"):
+            with (
+                self.subTest(ascend_version=ascend_version),
+                patch.dict(os.environ, {plugin._LIBRARY_ENV: "/unused/grouped.so"}),
+                patch.object(plugin, "version", side_effect=["0.23.0", ascend_version]),
+                patch.object(plugin, "import_module") as load,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "expects vllm-ascend"):
+                    plugin.register()
+                load.assert_not_called()

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Opt-in replacement of the 0.23.0 Ascend310P GDN recurrent helper."""
+"""Opt-in replacement of the 0.23.0/0.23.0rc1 Ascend310P GDN recurrent helper."""
 
 import inspect
 import logging
@@ -13,6 +13,7 @@ from pathlib import Path
 _LOG = logging.getLogger(__name__)
 _LIBRARY_ENV = "ASCEND310P_RGDR_PATCH_LIBRARY"
 _MODE_ENV = "ASCEND310P_RGDR_PATCH_MODE"
+_SUPPORTED_VERSION = re.compile(r"0\.23\.0(?:rc1)?(?:[.+-].+)?")
 _GDN_MODULE = "vllm_ascend._310p.ops.fla.gdn_310"
 _HELPER = "npu_recurrent_gated_delta_rule_310"
 _PARAMETERS = (
@@ -160,8 +161,8 @@ def register():
         raise ValueError(f"{_MODE_ENV} must be decode, spec or both")
     for package in ("vllm", "vllm-ascend"):
         installed = version(package)
-        if not re.match(r"^0\.23\.0(?:$|[.+-])", installed):
-            raise RuntimeError(f"Grouped RGDR patch expects {package} 0.23.0, found {installed}")
+        if not _SUPPORTED_VERSION.fullmatch(installed):
+            raise RuntimeError(f"Grouped RGDR patch expects {package} 0.23.0 or 0.23.0rc1, found {installed}")
     path = Path(library).expanduser()
     if not path.is_absolute() or not path.is_file():
         raise ValueError(f"{_LIBRARY_ENV} must point to an absolute path to the built .so")
