@@ -21,7 +21,7 @@ python3 -m pip install --no-deps .
 ```
 
 已安装插件时，在仓库根目录执行 `git pull --ff-only`，再运行
-`python3 -m pip install --no-deps --upgrade .`。0.1.1 的 rc1 兼容修复可以复用
+`python3 -m pip install --no-deps --upgrade .`。rc1 的 Python 兼容修复可以复用
 同一镜像里已编译的 RGDR `.so`。
 
 ## 2. 构建并启用算子
@@ -54,6 +54,25 @@ export ASCEND310P_RGDR_PATCH_LIBRARY="$RGDR_BUILD/librgdr_v310_cube_fp16_torch.s
 
 ```bash
 python3 -m ascend310p_rgdr_patch.smoke --device 0
+```
+
+原生对照需要镜像的 `custom_transformer` OPP 包。若仍出现
+`The infershape function does not exist`，确认下面的 vendor 目录在镜像中存在，
+按实际位置调整，并在新的 Python 进程里重跑。
+
+```bash
+rgdr_vendor=/vllm-workspace/vllm-ascend/vllm_ascend/_cann_ops_custom/vendors/custom_transformer
+if [ -d "$rgdr_vendor" ]; then
+  export ASCEND_CUSTOM_OPP_PATH="$rgdr_vendor${ASCEND_CUSTOM_OPP_PATH:+:$ASCEND_CUSTOM_OPP_PATH}"
+  python3 -m ascend310p_rgdr_patch.smoke --device 0
+fi
+```
+
+也可以用 FP32 CPU 参考检查 grouped 算子在 NPU 上的输出和原位 state 更新。
+此模式的通过结果仅覆盖 grouped 算子的数值检查。原生 A/B 仍需单独验证。
+
+```bash
+python3 -m ascend310p_rgdr_patch.smoke --device 0 --reference cpu
 ```
 
 然后用同事镜像的原启动参数启动 TP2 FP16 cache 的 `vllm serve`，去掉
