@@ -31,6 +31,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--reference", choices=("native", "cpu"), default="native")
+    parser.add_argument("--graph", action="store_true", help="capture grouped RGDR and verify ACLGraph replay")
     args = parser.parse_args()
 
     if args.reference == "native":
@@ -72,6 +73,7 @@ def main():
         v = random((1, batch, 16, 128), 0.1)
         g = -random((1, batch, 16), 0.03).abs()
         beta = random(g.shape, 0.2).sigmoid()
+        inputs = (q, k, v, g, beta)
         offsets = torch.arange(batch + 1, device=device, dtype=torch.int32)
         slots = torch.arange(batch, 0, -1, device=device, dtype=torch.int32)
         initial = random((batch + 1, 16, 128, 128), 0.02)
@@ -83,34 +85,74 @@ def main():
         }
 
         launch.reset_mock()
-        output = grouped(q, k, v, g, beta, grouped_state, **tail)
+        output = grouped(*inputs, grouped_state, **tail)
         launch.assert_called_once()
         torch.npu.synchronize()
 
-        if args.reference == "native":
-            reference_state = initial.clone()
-            try:
-                reference = native(q, k, v, g, beta, reference_state, **tail)
-                torch.npu.synchronize()
-            except RuntimeError as error:
-                raise RuntimeError(
-                    f"Grouped RGDR completed for B{batch}, but the native V310 reference failed. "
-                    f"ASCEND_CUSTOM_OPP_PATH={os.getenv('ASCEND_CUSTOM_OPP_PATH', '<unset>')}. "
-                    "Check the native custom_transformer OPP package, or run --reference cpu."
-                ) from error
-        else:
-            reference, reference_state = _cpu_reference(q, k, v, g, beta, initial, slots)
+        if args.graph:
+            grouped_state.copy_(initial)
+            graph = torch.npu.NPUGraph()
+            launch.reset_mock()
+            with torch.npu.graph(graph):
+                output = grouped(*inputs, grouped_state, **tail)
+            launch.assert_called_once()
+            grouped_state.copy_(initial)
+            graph.replay()
+            torch.npu.synchronize()
 
-        out_cpu, ref_cpu = output.cpu(), reference.cpu()
-        state_cpu, ref_state_cpu = grouped_state.cpu(), reference_state.cpu()
-        torch.testing.assert_close(out_cpu, ref_cpu, atol=2e-3, rtol=2e-3)
-        torch.testing.assert_close(state_cpu, ref_state_cpu, atol=2e-3, rtol=2e-3)
-        torch.testing.assert_close(state_cpu[0], initial[0].cpu(), atol=0, rtol=0)
-        print(
-            f"B{batch} W1 PASS reference={args.reference} "
-            f"out_max_abs={(out_cpu.float() - ref_cpu.float()).abs().max().item():.6g} "
-            f"state_max_abs={(state_cpu.float() - ref_state_cpu.float()).abs().max().item():.6g}"
-        )
+        _check_result(args.reference, batch, batch, output, grouped_state, initial, native, inputs, tail)
+        if args.graph and batch > 1:
+            active = batch // 2
+            # Match vLLM's graph padding: repeat the last offset and use slot 0.
+            # Change the active slots too, while retaining both captured addresses.
+            offsets[active + 1 :].fill_(active)
+            slots[:active].copy_(torch.arange(1, active + 1, dtype=torch.int32, device=device))
+            slots[active:].zero_()
+            grouped_state.copy_(initial)
+            output.fill_(float("nan"))
+            graph.replay()
+            torch.npu.synchronize()
+            launch.assert_called_once()
+            _check_result(args.reference, batch, active, output, grouped_state, initial, native, inputs, tail)
+        if args.graph:
+            print(f"B{batch} W1 ACLGraph capture/replay PASS", flush=True)
+
+
+def _check_result(reference_mode, batch, active, output, grouped_state, initial, native, inputs, tail):
+    valid_inputs = tuple(tensor[:, :active] for tensor in inputs)
+    slots = tail["ssm_state_indices"][:active]
+    if reference_mode == "native":
+        reference_state = initial.clone()
+        try:
+            reference = native(
+                *valid_inputs,
+                reference_state,
+                cu_seqlens=tail["cu_seqlens"][: active + 1],
+                ssm_state_indices=slots,
+                use_qk_l2norm_in_kernel=False,
+            )
+            torch.npu.synchronize()
+        except RuntimeError as error:
+            raise RuntimeError(
+                f"Grouped RGDR completed for B{batch}, but the native V310 reference failed. "
+                f"ASCEND_CUSTOM_OPP_PATH={os.getenv('ASCEND_CUSTOM_OPP_PATH', '<unset>')}. "
+                "Check the native custom_transformer OPP package, or run --reference cpu."
+            ) from error
+    else:
+        reference, reference_state = _cpu_reference(*valid_inputs, initial, slots)
+
+    out_cpu, ref_cpu = output[:, :active].cpu(), reference.cpu()
+    state_cpu, ref_state_cpu = grouped_state.cpu(), reference_state.cpu()
+    torch.testing.assert_close(out_cpu, ref_cpu, atol=2e-3, rtol=2e-3)
+    torch.testing.assert_close(state_cpu, ref_state_cpu, atol=2e-3, rtol=2e-3)
+    torch.testing.assert_close(state_cpu[0], initial[0].cpu(), atol=0, rtol=0)
+    padding = output[:, active:].cpu()
+    torch.testing.assert_close(padding, torch.zeros_like(padding), atol=0, rtol=0)
+    print(
+        f"B{batch} W1 PASS active={active} reference={reference_mode} "
+        f"out_max_abs={(out_cpu.float() - ref_cpu.float()).abs().max().item():.6g} "
+        f"state_max_abs={(state_cpu.float() - ref_state_cpu.float()).abs().max().item():.6g}"
+    )
 
 
 if __name__ == "__main__":

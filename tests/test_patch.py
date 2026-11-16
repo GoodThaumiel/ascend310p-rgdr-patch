@@ -80,14 +80,20 @@ class TestDispatch(unittest.TestCase):
         args["k"] = args["k"][:, :, :4]
         args["cu_seqlens"] = torch.tensor([0, 1])
         args["ssm_state_indices"] = torch.tensor([1])
-        wrapped = plugin._wrap(self.original, self.normalize, self.grouped, "decode", torch, diagnostics=True)
+        is_capturing = Mock(side_effect=[False, True, True])
+        wrapped = plugin._wrap(
+            self.original, self.normalize, self.grouped, "decode", torch, diagnostics=True, is_capturing=is_capturing
+        )
         with self.assertLogs(plugin.__name__, level="WARNING") as logs:
             wrapped(**args)
             wrapped(**args)
-        self.assertEqual(len(logs.output), 1)
+            wrapped(**args)
+        self.assertEqual(len(logs.output), 2)
         self.assertIn("route=native reason=unsupported Q/K/V or gate/beta shape", logs.output[0])
         self.assertIn("q=((1, 1, 4, 128)", logs.output[0])
-        self.assertEqual(self.original.call_count, 2)
+        self.assertIn("capturing=False", logs.output[0])
+        self.assertIn("capturing=True", logs.output[1])
+        self.assertEqual(self.original.call_count, 3)
         self.grouped.assert_not_called()
 
 

@@ -91,7 +91,7 @@ def _tensor_metadata(tensor):
     return (tuple(tensor.shape), str(tensor.dtype), str(tensor.device))
 
 
-def _wrap(original, normalize, grouped, mode, torch, *, diagnostics=False):
+def _wrap(original, normalize, grouped, mode, torch, *, diagnostics=False, is_capturing=None):
     logged_routes = set()
 
     @wraps(original)
@@ -114,12 +114,13 @@ def _wrap(original, normalize, grouped, mode, torch, *, diagnostics=False):
             reason = _geometry_mismatch(
                 q, k, v, g, beta, state, cu_seqlens, ssm_state_indices, num_accepted_tokens, torch
             )
-        if diagnostics and (speculative, reason) not in logged_routes:
-            logged_routes.add((speculative, reason))
+        capturing = diagnostics and is_capturing is not None and is_capturing()
+        if diagnostics and (speculative, reason, capturing) not in logged_routes:
+            logged_routes.add((speculative, reason, capturing))
             _LOG.warning(
                 "RGDR dispatch pid=%s mode=%s speculative=%s route=%s reason=%s "
                 "q=%s k=%s v=%s gate=%s beta=%s state=%s state_stride=%s state_offset=%s "
-                "offsets=%s slots=%s accepted=%s",
+                "offsets=%s slots=%s accepted=%s capturing=%s",
                 os.getpid(),
                 mode,
                 speculative,
@@ -136,6 +137,7 @@ def _wrap(original, normalize, grouped, mode, torch, *, diagnostics=False):
                 _tensor_metadata(cu_seqlens),
                 _tensor_metadata(ssm_state_indices),
                 _tensor_metadata(num_accepted_tokens),
+                capturing,
             )
         if reason:
             return original(
@@ -224,7 +226,18 @@ def register():
     op = getattr(torch.ops.rgdr_v310_cube_fp16, "run_", None)
     if op is None or not any(arg.name == "row_offsets" for arg in op.default._schema.arguments):
         raise RuntimeError("The RGDR .so must export run_ with packed row_offsets support")
-    setattr(gdn, _HELPER, _wrap(original, gdn.l2norm_310p, op.default, mode, torch, diagnostics=diagnostics))
+    is_capturing = None
+    if diagnostics:
+        from vllm.forward_context import get_forward_context, is_forward_context_available
+
+        def is_capturing():
+            return is_forward_context_available() and getattr(get_forward_context(), "capturing", False)
+
+    setattr(
+        gdn,
+        _HELPER,
+        _wrap(original, gdn.l2norm_310p, op.default, mode, torch, diagnostics=diagnostics, is_capturing=is_capturing),
+    )
     _LOG.info("310P grouped RGDR monkey patch installed (mode=%s, library=%s)", mode, path)
     if diagnostics:
         _LOG.warning("RGDR patch active pid=%s mode=%s", os.getpid(), mode)

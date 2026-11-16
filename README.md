@@ -75,8 +75,15 @@ fi
 python3 -m ascend310p_rgdr_patch.smoke --device 0 --reference cpu
 ```
 
-然后用同事镜像的原启动参数启动 TP2 FP16 cache 的 `vllm serve`，去掉
-`--speculative-config`，第一轮加 `--enforce-eager`。在独立的服务 trace 中确认
+图模式部署先运行下面的命令。它在 B1 和 B32 上捕获并重放，
+再用同一 B32 图重放 16 个活跃请求，检查槽位变更、padding 输出及 state 写回。
+
+```bash
+python3 -m ascend310p_rgdr_patch.smoke --device 0 --graph
+```
+
+然后用镜像的原图模式参数启动 TP2 FP16 cache 的 `vllm serve`。测试普通 decode
+时关闭投机解码。在独立的服务 trace 中确认
 `rgdr_v310_cube_grouped_packed_fp16` 出现在普通 decode，排除 shape 回退。
 用相同模型、请求、并发和采样设置做两次压测，分别关闭和开启扩展。若沿用
 2k/400、B32 配置，可用以下命令。性能运行时关闭 profiler。
@@ -91,13 +98,13 @@ vllm bench serve --backend openai --endpoint /v1/completions --host 127.0.0.1 --
 ```
 
 回传镜像版本、CANN/Torch/torch_npu 版本、W=1 误差、trace 算子名、
-输出吞吐与 TPOT/ITL p50/p90。若生产用图模式，eager 对照通过后，用双方相同的图模式配置复测。
+输出吞吐与 TPOT/ITL p50/p90。A/B 两侧使用相同的图模式配置。
 
 ### 服务仍走原生 V310
 
 Smoke 手动注册插件，并使用固定的 8 个 Q/K head、16 个 V head、FP16 state。
 服务由 vLLM 加载插件，并按模型实际输入判定。先在同一个 shell 里设置下面的变量，
-用原有参数加 `--enforce-eager` 启动服务，再发一条输出多 token 的请求。
+用原有图模式参数重新启动服务，再发一条输出多 token 的请求。
 
 ```bash
 export ASCEND310P_RGDR_PATCH_LIBRARY="$PWD/native-src/build/librgdr_v310_cube_fp16_torch.so"
@@ -112,8 +119,8 @@ export ASCEND310P_RGDR_PATCH_DIAGNOSTICS=1
 - `RGDR dispatch ... route=native` 会给出回退原因及输入元数据。开启 MTP 时，
   默认 `decode` 模式会将验证窗口交给原生算子。要验证替换投机窗口，可显式设为
   `ASCEND310P_RGDR_PATCH_MODE=spec`。
-- `RGDR dispatch ... route=grouped` 表示该次调用选择了 grouped 路径。用同一 rank 的
-  设备 trace 查找 `rgdr_v310_cube_grouped_packed_fp16`。
+- `RGDR dispatch` 的 `capturing=True` 表示日志来自图捕获。Python 分派记录的是捕获时的选择，
+  重放应在同一 rank 的设备 trace 中核对 `rgdr_v310_cube_grouped_packed_fp16`。
 
 ### 单独确认服务分派
 
