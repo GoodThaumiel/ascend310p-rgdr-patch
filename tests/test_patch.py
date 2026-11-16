@@ -74,6 +74,22 @@ class TestDispatch(unittest.TestCase):
         self.normalize.assert_not_called()
         self.grouped.assert_not_called()
 
+    def test_diagnostics_identify_mismatched_service_geometry_once(self):
+        args = make_args(1)
+        args["q"] = args["q"][:, :, :4]
+        args["k"] = args["k"][:, :, :4]
+        args["cu_seqlens"] = torch.tensor([0, 1])
+        args["ssm_state_indices"] = torch.tensor([1])
+        wrapped = plugin._wrap(self.original, self.normalize, self.grouped, "decode", torch, diagnostics=True)
+        with self.assertLogs(plugin.__name__, level="WARNING") as logs:
+            wrapped(**args)
+            wrapped(**args)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("route=native reason=unsupported Q/K/V or gate/beta shape", logs.output[0])
+        self.assertIn("q=((1, 1, 4, 128)", logs.output[0])
+        self.assertEqual(self.original.call_count, 2)
+        self.grouped.assert_not_called()
+
 
 class TestRegistration(unittest.TestCase):
     def test_disabled_registration_does_not_import_ascend(self):

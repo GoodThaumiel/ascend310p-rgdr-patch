@@ -13,6 +13,7 @@ from pathlib import Path
 _LOG = logging.getLogger(__name__)
 _LIBRARY_ENV = "ASCEND310P_RGDR_PATCH_LIBRARY"
 _MODE_ENV = "ASCEND310P_RGDR_PATCH_MODE"
+_DIAGNOSTICS_ENV = "ASCEND310P_RGDR_PATCH_DIAGNOSTICS"
 _SUPPORTED_VERSION = re.compile(r"0\.23\.0(?:rc1)?(?:[.+-].+)?")
 _GDN_MODULE = "vllm_ascend._310p.ops.fla.gdn_310"
 _HELPER = "npu_recurrent_gated_delta_rule_310"
@@ -37,18 +38,18 @@ _MAX_WINDOW = 8
 _CORES = 7
 
 
-def _matches_geometry(q, k, v, g, beta, state, offsets, slots, accepted, torch):
+def _geometry_mismatch(q, k, v, g, beta, state, offsets, slots, accepted, torch):
     if offsets is None or offsets.ndim != 1 or slots is None or g is None:
-        return False
+        return "missing or incompatible offsets, slots, or gate"
     batch = offsets.numel() - 1
     if not 1 <= batch <= _MAX_BATCH or v.ndim != 4:
-        return False
+        return "unsupported batch size or V rank"
     tokens = v.shape[1]
     if not 1 <= tokens <= _MAX_BATCH * _MAX_WINDOW:
-        return False
+        return "unsupported token count"
     if accepted is None:
         if slots.ndim != 1 or slots.numel() < batch:
-            return False
+            return "incompatible decode slots"
     elif (
         slots.ndim != 2
         or slots.shape[0] < batch
@@ -56,25 +57,43 @@ def _matches_geometry(q, k, v, g, beta, state, offsets, slots, accepted, torch):
         or accepted.ndim != 1
         or accepted.numel() < batch
     ):
-        return False
-    return (
-        q.shape == k.shape == (1, tokens, _KEY_HEADS, _HEAD_DIM)
-        and v.shape == (1, tokens, _VALUE_HEADS, _HEAD_DIM)
-        and g.shape == beta.shape == (1, tokens, _VALUE_HEADS)
-        and state.ndim == 4
-        and state.shape[0] > 1
-        and state.shape[1:] == (_VALUE_HEADS, _HEAD_DIM, _HEAD_DIM)
-        and state.dtype == torch.float16
+        return "incompatible speculative slots or accepted-token metadata"
+    if (
+        q.shape != (1, tokens, _KEY_HEADS, _HEAD_DIM)
+        or k.shape != q.shape
+        or v.shape != (1, tokens, _VALUE_HEADS, _HEAD_DIM)
+        or g.shape != (1, tokens, _VALUE_HEADS)
+        or beta.shape != g.shape
+    ):
+        return "unsupported Q/K/V or gate/beta shape"
+    if not (state.ndim == 4 and state.shape[0] > 1 and state.shape[1:] == (_VALUE_HEADS, _HEAD_DIM, _HEAD_DIM)):
+        return "unsupported state shape"
+    if state.dtype != torch.float16:
+        return "state must be FP16"
+    if not (
+        state.layout == torch.strided
         and state.stride()[1:] == (_HEAD_DIM * _HEAD_DIM, _HEAD_DIM, 1)
         and state.stride(0) >= _STATE_ELEMS
         and state.stride(0) % 16 == 0
         and state.storage_offset() % 16 == 0
-        and all(t.device == v.device for t in (q, k, g, beta, state, offsets, slots))
-        and (accepted is None or accepted.device == v.device)
-    )
+    ):
+        return "unsupported state strides or alignment"
+    if any(t.device != v.device for t in (q, k, g, beta, state, offsets, slots)) or (
+        accepted is not None and accepted.device != v.device
+    ):
+        return "inputs or metadata are on different devices"
+    return None
 
 
-def _wrap(original, normalize, grouped, mode, torch):
+def _tensor_metadata(tensor):
+    if tensor is None:
+        return None
+    return (tuple(tensor.shape), str(tensor.dtype), str(tensor.device))
+
+
+def _wrap(original, normalize, grouped, mode, torch, *, diagnostics=False):
+    logged_routes = set()
+
     @wraps(original)
     def replacement(
         q,
@@ -89,18 +108,36 @@ def _wrap(original, normalize, grouped, mode, torch):
         use_qk_l2norm_in_kernel=True,
     ):
         speculative = num_accepted_tokens is not None
-        if (mode != "both" and speculative != (mode == "spec")) or not _matches_geometry(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            state,
-            cu_seqlens,
-            ssm_state_indices,
-            num_accepted_tokens,
-            torch,
-        ):
+        if mode != "both" and speculative != (mode == "spec"):
+            reason = "configured mode excludes this call"
+        else:
+            reason = _geometry_mismatch(
+                q, k, v, g, beta, state, cu_seqlens, ssm_state_indices, num_accepted_tokens, torch
+            )
+        if diagnostics and (speculative, reason) not in logged_routes:
+            logged_routes.add((speculative, reason))
+            _LOG.warning(
+                "RGDR dispatch pid=%s mode=%s speculative=%s route=%s reason=%s "
+                "q=%s k=%s v=%s gate=%s beta=%s state=%s state_stride=%s state_offset=%s "
+                "offsets=%s slots=%s accepted=%s",
+                os.getpid(),
+                mode,
+                speculative,
+                "native" if reason else "grouped",
+                reason or "matched",
+                _tensor_metadata(q),
+                _tensor_metadata(k),
+                _tensor_metadata(v),
+                _tensor_metadata(g),
+                _tensor_metadata(beta),
+                _tensor_metadata(state),
+                state.stride() if state.layout == torch.strided else None,
+                state.storage_offset() if state.layout == torch.strided else None,
+                _tensor_metadata(cu_seqlens),
+                _tensor_metadata(ssm_state_indices),
+                _tensor_metadata(num_accepted_tokens),
+            )
+        if reason:
             return original(
                 q,
                 k,
@@ -154,7 +191,10 @@ def _wrap(original, normalize, grouped, mode, torch):
 def register():
     """Called by vLLM's general plugin loader in driver and worker processes."""
     library = os.getenv(_LIBRARY_ENV)
+    diagnostics = os.getenv(_DIAGNOSTICS_ENV) == "1"
     if not library:
+        if diagnostics:
+            _LOG.warning("RGDR patch inactive pid=%s because %s is unset", os.getpid(), _LIBRARY_ENV)
         return
     mode = os.getenv(_MODE_ENV, "decode")
     if mode not in {"decode", "spec", "both"}:
@@ -184,5 +224,7 @@ def register():
     op = getattr(torch.ops.rgdr_v310_cube_fp16, "run_", None)
     if op is None or not any(arg.name == "row_offsets" for arg in op.default._schema.arguments):
         raise RuntimeError("The RGDR .so must export run_ with packed row_offsets support")
-    setattr(gdn, _HELPER, _wrap(original, gdn.l2norm_310p, op.default, mode, torch))
+    setattr(gdn, _HELPER, _wrap(original, gdn.l2norm_310p, op.default, mode, torch, diagnostics=diagnostics))
     _LOG.info("310P grouped RGDR monkey patch installed (mode=%s, library=%s)", mode, path)
+    if diagnostics:
+        _LOG.warning("RGDR patch active pid=%s mode=%s", os.getpid(), mode)

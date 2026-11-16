@@ -93,6 +93,28 @@ vllm bench serve --backend openai --endpoint /v1/completions --host 127.0.0.1 --
 回传镜像版本、CANN/Torch/torch_npu 版本、W=1 误差、trace 算子名、
 输出吞吐与 TPOT/ITL p50/p90。若生产用图模式，eager 对照通过后，用双方相同的图模式配置复测。
 
+### 服务仍走原生 V310
+
+Smoke 手动注册插件，并使用固定的 8 个 Q/K head、16 个 V head、FP16 state。
+服务由 vLLM 加载插件，并按模型实际输入判定。先在同一个 shell 里设置下面的变量，
+用原有参数加 `--enforce-eager` 启动服务，再发一条输出多 token 的请求。
+
+```bash
+export ASCEND310P_RGDR_PATCH_LIBRARY="$PWD/native-src/build/librgdr_v310_cube_fp16_torch.so"
+export ASCEND310P_RGDR_PATCH_DIAGNOSTICS=1
+```
+
+- `RGDR patch inactive` 表示进程没有收到库路径变量。
+- 没有 `RGDR patch active` 或 `inactive` 日志时，检查 `vllm serve` 使用的 Python 环境，
+  以及已有的 `VLLM_PLUGINS` 白名单是否包含 `ascend310p_grouped_rgdr`。
+- `RGDR patch active` 后仍无 `RGDR dispatch` 时，检查已发出的请求是否进入 decode，
+  以及该镜像实际使用的 GDN 调用入口。
+- `RGDR dispatch ... route=native` 会给出回退原因及输入元数据。开启 MTP 时，
+  默认 `decode` 模式会将验证窗口交给原生算子。要验证替换投机窗口，可显式设为
+  `ASCEND310P_RGDR_PATCH_MODE=spec`。
+- `RGDR dispatch ... route=grouped` 表示该次调用选择了 grouped 路径。用同一 rank 的
+  设备 trace 查找 `rgdr_v310_cube_grouped_packed_fp16`。
+
 ### 单独确认服务分派
 
 临时给服务启动命令追加
