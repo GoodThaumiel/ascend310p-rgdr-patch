@@ -29,10 +29,8 @@ _PARAMETERS = (
     "num_accepted_tokens",
     "use_qk_l2norm_in_kernel",
 )
-_KEY_HEADS = 8
-_VALUE_HEADS = 16
+_KEY_HEAD_COUNTS = (8, 16)
 _HEAD_DIM = 128
-_STATE_ELEMS = _VALUE_HEADS * _HEAD_DIM * _HEAD_DIM
 _MAX_BATCH = 1024
 _MAX_WINDOW = 8
 _CORES = 7
@@ -58,22 +56,25 @@ def _geometry_mismatch(q, k, v, g, beta, state, offsets, slots, accepted, torch)
         or accepted.numel() < batch
     ):
         return "incompatible speculative slots or accepted-token metadata"
+    key_heads = q.shape[2] if q.ndim == 4 else 0
+    value_heads = 2 * key_heads
     if (
-        q.shape != (1, tokens, _KEY_HEADS, _HEAD_DIM)
+        key_heads not in _KEY_HEAD_COUNTS
+        or q.shape != (1, tokens, key_heads, _HEAD_DIM)
         or k.shape != q.shape
-        or v.shape != (1, tokens, _VALUE_HEADS, _HEAD_DIM)
-        or g.shape != (1, tokens, _VALUE_HEADS)
+        or v.shape != (1, tokens, value_heads, _HEAD_DIM)
+        or g.shape != (1, tokens, value_heads)
         or beta.shape != g.shape
     ):
         return "unsupported Q/K/V or gate/beta shape"
-    if not (state.ndim == 4 and state.shape[0] > 1 and state.shape[1:] == (_VALUE_HEADS, _HEAD_DIM, _HEAD_DIM)):
+    if not (state.ndim == 4 and state.shape[0] > 1 and state.shape[1:] == (value_heads, _HEAD_DIM, _HEAD_DIM)):
         return "unsupported state shape"
     if state.dtype != torch.float16:
         return "state must be FP16"
     if not (
         state.layout == torch.strided
         and state.stride()[1:] == (_HEAD_DIM * _HEAD_DIM, _HEAD_DIM, 1)
-        and state.stride(0) >= _STATE_ELEMS
+        and state.stride(0) >= value_heads * _HEAD_DIM * _HEAD_DIM
         and state.stride(0) % 16 == 0
         and state.storage_offset() % 16 == 0
     ):

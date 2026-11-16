@@ -11,15 +11,16 @@ import ascend310p_rgdr_patch as plugin
 import torch
 
 
-def make_args(tokens, *, strided=False):
-    state = torch.zeros(4, 16 * 128 * 128 + 32, dtype=torch.float16)
-    state = state[:, 16:-16].view(4, 16, 128, 128)
+def make_args(tokens, *, strided=False, key_heads=8):
+    value_heads = 2 * key_heads
+    state = torch.zeros(4, value_heads * 128 * 128 + 32, dtype=torch.float16)
+    state = state[:, 16:-16].view(4, value_heads, 128, 128)
     return {
-        "q": torch.zeros(1, tokens, 8, 128),
-        "k": torch.zeros(1, tokens, 8, 128),
-        "v": torch.zeros(1, tokens, 16, 128),
-        "g": torch.zeros(1, tokens, 16),
-        "beta": torch.zeros(1, tokens, 16),
+        "q": torch.zeros(1, tokens, key_heads, 128),
+        "k": torch.zeros(1, tokens, key_heads, 128),
+        "v": torch.zeros(1, tokens, value_heads, 128),
+        "g": torch.zeros(1, tokens, value_heads),
+        "beta": torch.zeros(1, tokens, value_heads),
         "state": state if strided else state.contiguous(),
     }
 
@@ -63,6 +64,25 @@ class TestDispatch(unittest.TestCase):
         _, _, _, _, _, _, slots, accepted, *_ = self.grouped.call_args.args
         torch.testing.assert_close(slots, torch.tensor([[1, 2], [3, 4]], dtype=torch.int32))
         torch.testing.assert_close(accepted, torch.tensor([2, 1], dtype=torch.int32))
+
+    def test_decode_accepts_unsharded_rank_heads_with_padding(self):
+        args = make_args(32, strided=True, key_heads=16)
+        args["cu_seqlens"] = torch.tensor([0, 1, 2] + [2] * 30, dtype=torch.int32)
+        args["ssm_state_indices"] = torch.tensor([3, 1] + [0] * 30, dtype=torch.int32)
+        wrapped = plugin._wrap(self.original, self.normalize, self.grouped, "decode", torch)
+
+        result = wrapped(**args)
+
+        self.original.assert_not_called()
+        q, k, v, beta, gate, state, _, _, out, *_ = self.grouped.call_args.args
+        self.assertEqual(q.shape, k.shape)
+        self.assertEqual(q.shape, (32, 16, 128))
+        self.assertEqual(v.shape, out.shape)
+        self.assertEqual(v.shape, (32, 32, 128))
+        self.assertEqual(gate.shape, beta.shape)
+        self.assertEqual(gate.shape, (32, 32))
+        self.assertIs(state, args["state"])
+        self.assertEqual(result.shape, args["v"].shape)
 
     def test_unsupported_state_uses_native(self):
         args = make_args(1)

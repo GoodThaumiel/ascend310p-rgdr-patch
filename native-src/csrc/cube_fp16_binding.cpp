@@ -12,6 +12,7 @@
 #include "aclrtlaunch_rgdr_v310_cube_fp16.h"
 #include "aclrtlaunch_rgdr_v310_cube_grouped_fp16.h"
 #include "aclrtlaunch_rgdr_v310_cube_grouped_packed_fp16.h"
+#include "aclrtlaunch_rgdr_v310_cube_grouped_packed_fp16_h16.h"
 
 namespace {
 void cube_fp16(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
@@ -31,8 +32,12 @@ void cube_fp16(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
   const int64_t batch = accepted.numel();
   TORCH_CHECK(accepted.dim() == 1 && batch > 0 && batch <= 1024 &&
                   accepted.scalar_type() == at::kInt, "accepted must be int32[B]");
-  TORCH_CHECK(q.dim() == 3 && q.size(1) == 8 && q.size(2) == 128 &&
-                  q.sizes() == k.sizes(), "q/k must be [T,8,128]");
+  TORCH_CHECK(q.dim() == 3 && q.size(2) == 128 && q.sizes() == k.sizes(),
+              "q/k must be [T,H,128]");
+  const int64_t key_heads = q.size(1);
+  TORCH_CHECK(key_heads == 8 || (row_offsets && key_heads == 16),
+              "q/k require 8 heads, or 16 heads for packed grouped RGDR");
+  const int64_t value_heads = 2 * key_heads;
   const int64_t tokens = q.size(0);
   int64_t window;
   if (row_offsets) {
@@ -48,19 +53,19 @@ void cube_fp16(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
     TORCH_CHECK(grouped || window == 4 || window == 8, "legacy Cube variants require MTP3/7");
   }
   TORCH_CHECK(window >= 1 && window <= 8, "Cube window must be in [1,8]");
-  TORCH_CHECK(v.sizes() == at::IntArrayRef({tokens, 16, 128}) &&
-                  v.sizes() == out.sizes(), "v/out must be [T,16,128]");
-  TORCH_CHECK(beta.sizes() == at::IntArrayRef({tokens, 16}) && gate.sizes() == beta.sizes(),
-              "beta/gate must be [T,16]");
+  TORCH_CHECK(v.sizes() == at::IntArrayRef({tokens, value_heads, 128}) &&
+                  v.sizes() == out.sizes(), "v/out must be [T,2H,128]");
+  TORCH_CHECK(beta.sizes() == at::IntArrayRef({tokens, value_heads}) && gate.sizes() == beta.sizes(),
+              "beta/gate must be [T,2H]");
   TORCH_CHECK(indices.scalar_type() == at::kInt &&
                   (row_offsets || (indices.dim() == 1 && indices.numel() == tokens)),
               "indices must be int32[T] for uniform or int32[B,W] for packed");
   TORCH_CHECK(state.dim() == 4 && state.size(0) > 1 &&
-                  state.size(0) <= std::numeric_limits<int32_t>::max() && state.size(1) == 16 &&
+                  state.size(0) <= std::numeric_limits<int32_t>::max() && state.size(1) == value_heads &&
                   state.size(2) == 128 && state.size(3) == 128 &&
                   state.device() == q.device(), "invalid state geometry or device");
   TORCH_CHECK(state.stride(3) == 1 && state.stride(2) == 128 && state.stride(1) == 128 * 128 &&
-                  state.stride(0) >= 16 * 128 * 128 && state.stride(0) % 16 == 0 &&
+                  state.stride(0) >= value_heads * 128 * 128 && state.stride(0) % 16 == 0 &&
                   state.storage_offset() % 16 == 0, "state pages must be 32-byte aligned with contiguous inner axes");
   TORCH_CHECK(row_offsets || state.is_contiguous(), "uniform Cube RGDR requires contiguous state");
   TORCH_CHECK(cores >= 1 && cores <= 7 && std::isfinite(scale) && scale > 0 && scale <= 1,
@@ -74,7 +79,11 @@ void cube_fp16(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
       static_cast<uint32_t>(window), static_cast<uint32_t>(state.size(0)), \
       static_cast<float>(scale)
   aclError result;
-  if (row_offsets) {
+  if (row_offsets && key_heads == 16) {
+    result = aclrtlaunch_rgdr_v310_cube_grouped_packed_fp16_h16(
+        RGDR_ARGS, row_offsets->data_ptr(), static_cast<uint32_t>(tokens),
+        static_cast<uint64_t>(state.stride(0)));
+  } else if (row_offsets) {
     result = aclrtlaunch_rgdr_v310_cube_grouped_packed_fp16(
         RGDR_ARGS, row_offsets->data_ptr(), static_cast<uint32_t>(tokens),
         static_cast<uint64_t>(state.stride(0)));

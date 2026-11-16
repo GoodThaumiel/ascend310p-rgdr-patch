@@ -7,7 +7,7 @@ from unittest.mock import Mock
 
 import torch
 
-from ascend310p_rgdr_patch import _wrap, register
+from ascend310p_rgdr_patch import _KEY_HEAD_COUNTS, _wrap, register
 
 
 def _cpu_reference(q, k, v, gate, beta, initial, slots):
@@ -32,6 +32,7 @@ def main():
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--reference", choices=("native", "cpu"), default="native")
     parser.add_argument("--graph", action="store_true", help="capture grouped RGDR and verify ACLGraph replay")
+    parser.add_argument("--key-heads", type=int, choices=_KEY_HEAD_COUNTS, default=8)
     args = parser.parse_args()
 
     if args.reference == "native":
@@ -67,16 +68,18 @@ def main():
     def random(shape, scale):
         return (torch.randn(shape, generator=rng) * scale).to(device=device, dtype=torch.float16)
 
+    key_heads = args.key_heads
+    value_heads = 2 * key_heads
     for batch in (1, 32):
-        q = random((1, batch, 8, 128), 0.1)
+        q = random((1, batch, key_heads, 128), 0.1)
         k = random(q.shape, 0.1)
-        v = random((1, batch, 16, 128), 0.1)
-        g = -random((1, batch, 16), 0.03).abs()
+        v = random((1, batch, value_heads, 128), 0.1)
+        g = -random((1, batch, value_heads), 0.03).abs()
         beta = random(g.shape, 0.2).sigmoid()
         inputs = (q, k, v, g, beta)
         offsets = torch.arange(batch + 1, device=device, dtype=torch.int32)
         slots = torch.arange(batch, 0, -1, device=device, dtype=torch.int32)
-        initial = random((batch + 1, 16, 128, 128), 0.02)
+        initial = random((batch + 1, value_heads, 128, 128), 0.02)
         grouped_state = initial.clone()
         tail = {
             "cu_seqlens": offsets,
@@ -149,7 +152,8 @@ def _check_result(reference_mode, batch, active, output, grouped_state, initial,
     padding = output[:, active:].cpu()
     torch.testing.assert_close(padding, torch.zeros_like(padding), atol=0, rtol=0)
     print(
-        f"B{batch} W1 PASS active={active} reference={reference_mode} "
+        f"B{batch} W1 PASS active={active} heads={valid_inputs[0].shape[2]}/{output.shape[2]} "
+        f"reference={reference_mode} "
         f"out_max_abs={(out_cpu.float() - ref_cpu.float()).abs().max().item():.6g} "
         f"state_max_abs={(state_cpu.float() - ref_state_cpu.float()).abs().max().item():.6g}"
     )

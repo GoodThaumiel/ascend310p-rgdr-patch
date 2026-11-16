@@ -1,8 +1,9 @@
 # vLLM Ascend 0.23.0 的 grouped RGDR monkey patch
 
-适用于 vLLM 0.23.0 与 vLLM Ascend 0.23.0 或 0.23.0rc1 搭配的 Ascend310P3 镜像。目标形状为每 rank
-8 个 Q/K head、16 个 value head、K=V=128，使用 FP16 SSM cache。例如该形状的
-Qwen 35B-A3B W8A8 TP2。默认只替换普通 GDN decode 的 recurrent 算子。
+适用于 vLLM 0.23.0 与 vLLM Ascend 0.23.0 或 0.23.0rc1 搭配的 Ascend310P3 镜像。
+每 rank 支持 Q/K 与 V head 数为 8/16 或 16/32，K=V=128，使用 FP16 SSM cache。
+例如 Qwen 35B-A3B W8A8 的 attention TP2 或 attention DP2 + MoE EP2。
+默认只替换普通 GDN decode 的 recurrent 算子。
 可选 `ASCEND310P_RGDR_PATCH_MODE=spec` 启用投机路径，或 `both` 启用两条路径。
 
 插件在每个 vLLM 进程中替换 `vllm_ascend._310p.ops.fla.gdn_310` 的一个 Python 函数。
@@ -21,8 +22,8 @@ python3 -m pip install --no-deps .
 ```
 
 已安装插件时，在仓库根目录执行 `git pull --ff-only`，再运行
-`python3 -m pip install --no-deps --upgrade .`。rc1 的 Python 兼容修复可以复用
-同一镜像里已编译的 RGDR `.so`。
+`python3 -m pip install --no-deps --upgrade .`。16/32 head 需要 0.1.5 对应的 RGDR
+`.so`，按下一节重新构建，并更新 `ASCEND310P_RGDR_PATCH_LIBRARY`。
 
 ## 2. 构建并启用算子
 
@@ -31,7 +32,7 @@ python3 -m pip install --no-deps .
 使扩展匹配镜像的 CPU 架构、CANN、Torch 和 torch_npu。CANN 路径请按镜像调整。
 
 ```bash
-export RGDR_BUILD="$PWD/native-src/build"
+export RGDR_BUILD="$PWD/native-src/build-h16"
 export RGDR_CANN=/usr/local/Ascend/cann-9.2.1
 cmake -S native-src -B "$RGDR_BUILD" -DCMAKE_BUILD_TYPE=Release \
   -DSOC_VERSION=Ascend310P3 -DASCEND_CANN_PACKAGE_PATH="$RGDR_CANN" \
@@ -80,11 +81,13 @@ python3 -m ascend310p_rgdr_patch.smoke --device 0 --reference cpu
 
 ```bash
 python3 -m ascend310p_rgdr_patch.smoke --device 0 --graph
+python3 -m ascend310p_rgdr_patch.smoke --device 0 --graph --key-heads 16
 ```
 
-然后用镜像的原图模式参数启动 TP2 FP16 cache 的 `vllm serve`。测试普通 decode
+然后用镜像的原图模式和并行参数启动 FP16 cache 的 `vllm serve`。测试普通 decode
 时关闭投机解码。在独立的服务 trace 中确认
-`rgdr_v310_cube_grouped_packed_fp16` 出现在普通 decode，排除 shape 回退。
+`rgdr_v310_cube_grouped_packed_fp16`（8/16 head）或
+`rgdr_v310_cube_grouped_packed_fp16_h16`（16/32 head）出现在普通 decode。
 用相同模型、请求、并发和采样设置做两次压测，分别关闭和开启扩展。若沿用
 2k/400、B32 配置，可用以下命令。性能运行时关闭 profiler。
 
@@ -102,12 +105,12 @@ vllm bench serve --backend openai --endpoint /v1/completions --host 127.0.0.1 --
 
 ### 服务仍走原生 V310
 
-Smoke 手动注册插件，并使用固定的 8 个 Q/K head、16 个 V head、FP16 state。
+Smoke 手动注册插件，并使用 `--key-heads` 指定每 rank 的 Q/K head 数和对应的 V head 数。
 服务由 vLLM 加载插件，并按模型实际输入判定。先在同一个 shell 里设置下面的变量，
 用原有图模式参数重新启动服务，再发一条输出多 token 的请求。
 
 ```bash
-export ASCEND310P_RGDR_PATCH_LIBRARY="$PWD/native-src/build/librgdr_v310_cube_fp16_torch.so"
+export ASCEND310P_RGDR_PATCH_LIBRARY="$PWD/native-src/build-h16/librgdr_v310_cube_fp16_torch.so"
 export ASCEND310P_RGDR_PATCH_DIAGNOSTICS=1
 ```
 
@@ -120,7 +123,7 @@ export ASCEND310P_RGDR_PATCH_DIAGNOSTICS=1
   默认 `decode` 模式会将验证窗口交给原生算子。要验证替换投机窗口，可显式设为
   `ASCEND310P_RGDR_PATCH_MODE=spec`。
 - `RGDR dispatch` 的 `capturing=True` 表示日志来自图捕获。Python 分派记录的是捕获时的选择，
-  重放应在同一 rank 的设备 trace 中核对 `rgdr_v310_cube_grouped_packed_fp16`。
+  重放应在同一 rank 的设备 trace 中核对对应的 grouped kernel。
 
 ### 单独确认服务分派
 

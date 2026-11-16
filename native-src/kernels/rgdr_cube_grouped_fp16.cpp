@@ -7,9 +7,7 @@ using namespace AscendC;
 namespace {
 constexpr uint32_t K = 128;
 constexpr uint32_t V = 128;
-constexpr uint32_t HK = 8;
-constexpr uint32_t HV = 16;
-constexpr uint32_t PAIR = HV / HK;
+constexpr uint32_t PAIR = 2;
 constexpr uint32_t MAX_WINDOW = 8;
 constexpr uint32_t C0 = 16;
 constexpr uint32_t FRACTAL = C0 * C0;
@@ -30,8 +28,9 @@ __aicore__ inline void Sync()
     WaitFlag<Event>(id);
 }
 
-template <bool PACKED = false>
+template <bool PACKED = false, uint32_t HK = 8>
 class GroupedFp16RGDR {
+    static constexpr uint32_t HV = HK * PAIR;
 public:
     __aicore__ inline void Init(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR gate,
                                 GM_ADDR state, GM_ADDR indices, GM_ADDR accepted, GM_ADDR out,
@@ -390,6 +389,17 @@ extern "C" __global__ __aicore__ void rgdr_v310_cube_grouped_packed_fp16(
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC);
     GroupedFp16RGDR<true> op;
+    op.Init(q, k, v, beta, gate, state, indices, accepted, out, batch, window, slots, scale, rowOffsets, tokens, stateStride);
+    op.Process();
+}
+
+extern "C" __global__ __aicore__ void rgdr_v310_cube_grouped_packed_fp16_h16(
+    GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR gate, GM_ADDR state,
+    GM_ADDR indices, GM_ADDR accepted, GM_ADDR out, uint32_t batch, uint32_t window,
+    uint32_t slots, float scale, GM_ADDR rowOffsets, uint32_t tokens, uint64_t stateStride)
+{
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC);
+    GroupedFp16RGDR<true, 16> op;
     op.Init(q, k, v, beta, gate, state, indices, accepted, out, batch, window, slots, scale, rowOffsets, tokens, stateStride);
     op.Process();
 }
