@@ -34,7 +34,7 @@ _KEY_HEAD_COUNTS = (8, 16)
 _HEAD_DIM = 128
 _MAX_BATCH = 1024
 _MAX_WINDOW = 8
-_DEFAULT_CORES = 7
+_DEFAULT_CORES = 8
 _MAX_CORES = 8
 
 
@@ -203,6 +203,20 @@ def _configured_cores():
     return cores
 
 
+def _check_versions():
+    for package in ("vllm", "vllm-ascend"):
+        installed = version(package)
+        if not _SUPPORTED_VERSION.fullmatch(installed):
+            raise RuntimeError(f"Grouped RGDR patch expects {package} 0.23.0 or 0.23.0rc1, found {installed}")
+
+
+def _configured_mode():
+    mode = os.getenv(_MODE_ENV, "decode")
+    if mode not in {"decode", "spec", "both"}:
+        raise ValueError(f"{_MODE_ENV} must be decode, spec or both")
+    return mode
+
+
 def register():
     """Called by vLLM's general plugin loader in driver and worker processes."""
     library = os.getenv(_LIBRARY_ENV)
@@ -211,14 +225,9 @@ def register():
         if diagnostics:
             _LOG.warning("RGDR patch inactive pid=%s because %s is unset", os.getpid(), _LIBRARY_ENV)
         return
-    mode = os.getenv(_MODE_ENV, "decode")
-    if mode not in {"decode", "spec", "both"}:
-        raise ValueError(f"{_MODE_ENV} must be decode, spec or both")
+    mode = _configured_mode()
     cores = _configured_cores()
-    for package in ("vllm", "vllm-ascend"):
-        installed = version(package)
-        if not _SUPPORTED_VERSION.fullmatch(installed):
-            raise RuntimeError(f"Grouped RGDR patch expects {package} 0.23.0 or 0.23.0rc1, found {installed}")
+    _check_versions()
     path = Path(library).expanduser()
     if not path.is_absolute() or not path.is_file():
         raise ValueError(f"{_LIBRARY_ENV} must point to an absolute path to the built .so")

@@ -30,7 +30,7 @@ def _assert_bits(actual, expected, case):
 @torch.inference_mode()
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--variant", choices=("native", *_PROBES), required=True)
+    parser.add_argument("--variant", choices=("native", *_PROBES), default="baseline")
     parser.add_argument("--batch", type=int, default=32)
     parser.add_argument("--window", type=int, choices=range(1, 9), default=4)
     parser.add_argument("--key-heads", type=int, choices=(8, 16), default=8)

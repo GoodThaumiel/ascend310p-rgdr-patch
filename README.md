@@ -3,7 +3,7 @@
 适用于 vLLM 0.23.0 与 vLLM Ascend 0.23.0 或 0.23.0rc1 搭配的 Ascend310P3 镜像。
 每 rank 支持 Q/K 与 V head 数为 8/16 或 16/32，K=V=128，使用 FP16 SSM cache。
 例如 Qwen 35B-A3B W8A8 的 attention TP2 或 attention DP2 + MoE EP2。
-默认只替换普通 GDN decode 的 recurrent 算子。
+默认使用 **8 核 grouped baseline** 替换普通 GDN decode 的 recurrent 算子。
 可选 `ASCEND310P_RGDR_PATCH_MODE=spec` 启用投机路径，或 `both` 启用两条路径。
 
 插件在每个 vLLM 进程中替换 `vllm_ascend._310p.ops.fla.gdn_310` 的一个 Python 函数。
@@ -11,27 +11,45 @@
 Prefill、卷积、采样、调度和 cache 分配沿用镜像原逻辑。形状或 cache layout 超出范围时
 沿用原生函数。独立扩展使用全 FP16 递推，原生 gate 输入是 FP32，输出可能有舍入差。
 
-## 1. 安装插件
+## 1. 一键安装并启动
 
-在目标镜像中执行以下命令。使用启动 vLLM 的同一个 Python 环境。
+在已安装 vLLM、vLLM Ascend、Torch、torch_npu 和 CANN Toolkit 的目标镜像中运行。
 
 ```bash
 git clone git@github.com:GoodThaumiel/ascend310p-rgdr-patch.git
 cd ascend310p-rgdr-patch
-python3 -m pip install --no-deps .
+./setup.sh -- "$MODEL" --tensor-parallel-size 2 --host 127.0.0.1 --port 18083
 ```
 
-已安装插件时，在仓库根目录执行 `git pull --ff-only`，再运行
-`python3 -m pip install --no-deps --upgrade .`。16/32 head 需要 0.1.5 对应的 RGDR
-`.so`，按下一节重新构建，并更新 `ASCEND310P_RGDR_PATCH_LIBRARY`。
+将 `--` 后的参数换成原来的 `vllm serve` 参数，图模式沿用原配置。测试 MTP
+投机验证时，在命令前加 `ASCEND310P_RGDR_PATCH_MODE=spec`，或用 `both` 同时替换两条路径。
 
-## 2. 构建并启用算子
+脚本优先使用当前 shell 配置的 CANN Toolkit，其次搜索常见安装目录。它加载 Toolkit
+的 `set_env.sh`，输出 CANN 和 Python 包版本，核对 vLLM Ascend 310P 版本和
+插件入口，编译独立扩展并通过 Python entry point 注册 monkey patch。已有
+`VLLM_PLUGINS` 名单会保留并补充 Ascend 平台和 RGDR 插件。镜像内已有的
+`custom_transformer` vendor 目录会加入 OPP 搜索路径。
+
+只配置时执行 `./setup.sh`。配置完成后，重启服务可以直接使用生成的 launcher。
+
+```bash
+./build/rgdr-serve/vllm-serve "$MODEL" --tensor-parallel-size 2 --port 18083
+```
+
+迁移到其他 Python 环境或 CANN 安装时重新运行 `setup.sh`。非标准安装可传入
+`--python /path/to/python3`、`--cann-root /path/to/toolkit` 和
+`--cann-env /path/to/set_env.sh`。需要直接运行 profiling 或 smoke 时，先按脚本输出
+`source` 生成的 `env.sh`，用同一个 Python 执行。已 clone 的仓库可先
+`git pull --ff-only` 再运行脚本。
+
+## 2. 手动构建并启用算子
 
 仓库包含从 [`c28ba22`](https://github.com/GoodThaumiel/vllm-ascend/commit/c28ba222643929ad63afa51b72fb0f823dc9e5fc)
 提取的 packed grouped kernel 和 Torch binding。在目标镜像中编译，
 使扩展匹配镜像的 CPU 架构、CANN、Torch 和 torch_npu。CANN 路径请按镜像调整。
 
 ```bash
+python3 -m pip install --no-deps --upgrade .
 export RGDR_BUILD="$PWD/native-src/build-h16"
 export RGDR_CANN=/usr/local/Ascend/cann-9.2.1
 cmake -S native-src -B "$RGDR_BUILD" -DCMAKE_BUILD_TYPE=Release \
@@ -152,7 +170,7 @@ curl -fsS -X POST http://127.0.0.1:18083/stop_profile
 
 先检查三个变体在 B32 上的输出与 state。普通 decode 用 W1，MTP3 用 W4，
 MTP7 用 W8。W1 没有跨 token 的前一轮写回等待，可作为 `defer-write-wait` 的对照。
-默认 8 个 Q/K head、16 个 V head、7 个核。如果实际模型每 rank 为 16/32，
+默认 8 个 Q/K head、16 个 V head、8 个核。如果实际模型每 rank 为 16/32，
 将下面的 `RGDR_KEY_HEADS` 改成 16。
 
 0.1.6 上机时，B32/W4/H8 的 `defer-write-wait` 图重放在候选 state 逐位比对失败。
@@ -177,7 +195,7 @@ done
 for window in 1 4 8; do
   for variant in batch-pack defer-write-wait no-state-store; do
     python3 -m ascend310p_rgdr_patch.profile --check --graph \
-      --variant "$variant" --batch 32 --window "$window" --cores 7 \
+      --variant "$variant" --batch 32 --window "$window" --cores 8 \
       --key-heads "$RGDR_KEY_HEADS" --device "$RGDR_DEVICE" || exit 1
   done
 done
@@ -196,7 +214,7 @@ for window in 4 1 8; do
   for variant in native baseline batch-pack defer-write-wait no-state-store; do
     msprof --output="$RGDR_PROFILE_OUT/$variant-w$window" --ai-core=on --aic-metrics=PipeUtilization \
       python3 -m ascend310p_rgdr_patch.profile --graph \
-      --variant "$variant" --batch 32 --window "$window" --cores 7 \
+      --variant "$variant" --batch 32 --window "$window" --cores 8 \
       --key-heads "$RGDR_KEY_HEADS" --device "$RGDR_DEVICE" \
       --warmup 20 --iterations 100 || exit 1
   done
@@ -217,8 +235,9 @@ Scalar、Vector、MTE1/2/3、MAC 的绝对时间。几个流水的时间可重�
 
 ## 5. Grouped 7 核与 8 核对照
 
-0.1.8 支持 `blockDim=8`。按第 2 节重编自定义 `.so`，并重新安装 Python 包。
-服务和脚本默认仍为 7 核。核内计算和任务编号沿用当前实现，
+0.1.9 默认使用 `blockDim=8`，profiling 脚本默认选择 `baseline`。
+按第 1 节配置好扩展和环境后运行以下对照。
+核内计算和任务编号沿用当前实现，
 每个 block 以实际 `GetBlockNum()` 为步长分配 `(request, head-pair)`。
 
 先选实际的每 rank head 数。TP2 用 `RGDR_KEY_HEADS=8`，
@@ -251,6 +270,6 @@ for cores in 7 8; do
 done
 ```
 
-验证服务时，在启动前设置 `ASCEND310P_RGDR_PATCH_CORES=8` 环境变量。
-第 3 节的普通 decode 图重放 smoke 也读取该变量。服务重启并重新捕图后，
-worker 日志应显示 `cores=8`，可在设备 trace 中核对 blockDim。
+服务启动时 worker 日志应显示 `cores=8`，可在设备 trace 中核对 Block Dim。
+对照 c7 时，在启动前设置 `ASCEND310P_RGDR_PATCH_CORES=7` 并重新捕图。
+第 3 节的普通 decode 图重放 smoke 也读取该变量。

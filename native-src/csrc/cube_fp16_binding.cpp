@@ -120,7 +120,7 @@ void cube_fp16(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
 
 TORCH_LIBRARY(rgdr_v310_cube_fp16, m) {
   m.def("run_(Tensor q, Tensor k, Tensor v, Tensor beta, Tensor gate, Tensor(a!) state, "
-        "Tensor indices, Tensor accepted, Tensor(b!) out, float scale, bool deq, int cores=7, "
+        "Tensor indices, Tensor accepted, Tensor(b!) out, float scale, bool deq, int cores=8, "
         "bool grouped=False, Tensor? row_offsets=None, int probe=0) -> ()");
 }
 TORCH_LIBRARY_IMPL(rgdr_v310_cube_fp16, PrivateUse1, m) {

@@ -48,7 +48,7 @@ class TestDispatch(unittest.TestCase):
         torch.testing.assert_close(slots, torch.tensor([[3], [1], [0]], dtype=torch.int32))
         torch.testing.assert_close(accepted, torch.ones(3, dtype=torch.int32))
         torch.testing.assert_close(offsets, args["cu_seqlens"].int())
-        self.assertEqual((scale, deq, cores, grouped), (128**-0.5, False, 7, True))
+        self.assertEqual((scale, deq, cores, grouped), (128**-0.5, False, 8, True))
 
     def test_spec_mode_preserves_previous_slot_outside_short_window(self):
         args = make_args(3)
@@ -129,10 +129,10 @@ class TestRegistration(unittest.TestCase):
             with self.subTest(ascend_version=ascend_version):
                 self._check_registration(ascend_version)
 
-    def test_registration_propagates_c8_to_grouped_launch(self):
-        self._check_registration("0.23.0rc1", cores=8)
+    def test_registration_propagates_c7_override_to_grouped_launch(self):
+        self._check_registration("0.23.0rc1", cores=7)
 
-    def _check_registration(self, ascend_version, *, cores=7):
+    def _check_registration(self, ascend_version, *, cores=None):
         source = f"def {plugin._HELPER}({', '.join(plugin._PARAMETERS)}): pass"
         module = SimpleNamespace(l2norm_310p=Mock())
         ns = {}
@@ -151,8 +151,10 @@ class TestRegistration(unittest.TestCase):
         ):
             library = Path(directory) / "grouped.so"
             library.touch()
-            env = {plugin._LIBRARY_ENV: str(library), plugin._MODE_ENV: "decode", plugin._CORES_ENV: str(cores)}
-            with patch.dict(os.environ, env):
+            env = {plugin._LIBRARY_ENV: str(library)}
+            if cores is not None:
+                env[plugin._CORES_ENV] = str(cores)
+            with patch.dict(os.environ, env, clear=True):
                 plugin.register()
                 wrapped = getattr(module, plugin._HELPER)
                 plugin.register()
@@ -165,7 +167,7 @@ class TestRegistration(unittest.TestCase):
             ssm_state_indices=torch.tensor([1]),
             use_qk_l2norm_in_kernel=False,
         )
-        self.assertEqual(grouped.default.call_args.args[11], cores)
+        self.assertEqual(grouped.default.call_args.args[11], 8 if cores is None else cores)
 
     def test_other_releases_are_rejected(self):
         for ascend_version in ("0.23.0rc10", "0.23.0rc2", "0.23.1"):
