@@ -13,14 +13,22 @@
 #include "aclrtlaunch_rgdr_v310_cube_grouped_fp16.h"
 #include "aclrtlaunch_rgdr_v310_cube_grouped_packed_fp16.h"
 #include "aclrtlaunch_rgdr_v310_cube_grouped_packed_fp16_h16.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_batch_pack.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_batch_pack_h16.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_defer_write_wait.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_defer_write_wait_h16.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_no_state_store.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_no_state_store_h16.h"
 
 namespace {
 void cube_fp16(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
                const at::Tensor& beta, const at::Tensor& gate, const at::Tensor& state,
                const at::Tensor& indices, const at::Tensor& accepted, const at::Tensor& out,
                double scale, bool deq, int64_t cores, bool grouped,
-               const std::optional<at::Tensor>& row_offsets) {
+               const std::optional<at::Tensor>& row_offsets, int64_t probe) {
   TORCH_CHECK(!grouped || !deq, "grouped RGDR uses one L0C drain and scales in UB");
+  TORCH_CHECK(probe >= 0 && probe <= 3 && (probe == 0 || (grouped && row_offsets)),
+              "RGDR probes 1–3 require packed grouped inputs");
   TORCH_CHECK(q.device().type() == c10::DeviceType::PrivateUse1, "NPU tensors required");
   for (const auto& tensor : {q, k, v, beta, gate, indices, accepted, out}) {
     TORCH_CHECK(tensor.device() == q.device() && tensor.is_contiguous(),
@@ -79,7 +87,19 @@ void cube_fp16(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
       static_cast<uint32_t>(window), static_cast<uint32_t>(state.size(0)), \
       static_cast<float>(scale)
   aclError result;
-  if (row_offsets && key_heads == 16) {
+#define RGDR_PACKED_ARGS \
+  RGDR_ARGS, row_offsets->data_ptr(), static_cast<uint32_t>(tokens), \
+      static_cast<uint64_t>(state.stride(0))
+  if (probe == 1) {
+    result = key_heads == 16 ? aclrtlaunch_rgdr_v310_cube_probe_batch_pack_h16(RGDR_PACKED_ARGS)
+                             : aclrtlaunch_rgdr_v310_cube_probe_batch_pack(RGDR_PACKED_ARGS);
+  } else if (probe == 2) {
+    result = key_heads == 16 ? aclrtlaunch_rgdr_v310_cube_probe_defer_write_wait_h16(RGDR_PACKED_ARGS)
+                             : aclrtlaunch_rgdr_v310_cube_probe_defer_write_wait(RGDR_PACKED_ARGS);
+  } else if (probe == 3) {
+    result = key_heads == 16 ? aclrtlaunch_rgdr_v310_cube_probe_no_state_store_h16(RGDR_PACKED_ARGS)
+                             : aclrtlaunch_rgdr_v310_cube_probe_no_state_store(RGDR_PACKED_ARGS);
+  } else if (row_offsets && key_heads == 16) {
     result = aclrtlaunch_rgdr_v310_cube_grouped_packed_fp16_h16(
         RGDR_ARGS, row_offsets->data_ptr(), static_cast<uint32_t>(tokens),
         static_cast<uint64_t>(state.stride(0)));
@@ -92,6 +112,7 @@ void cube_fp16(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
   } else {
     result = aclrtlaunch_rgdr_v310_cube_fp16(RGDR_ARGS, static_cast<uint32_t>(deq));
   }
+#undef RGDR_PACKED_ARGS
 #undef RGDR_ARGS
   TORCH_CHECK(result == ACL_SUCCESS, "FP16 Cube RGDR launch failed: ", result);
 }
@@ -100,7 +121,7 @@ void cube_fp16(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
 TORCH_LIBRARY(rgdr_v310_cube_fp16, m) {
   m.def("run_(Tensor q, Tensor k, Tensor v, Tensor beta, Tensor gate, Tensor(a!) state, "
         "Tensor indices, Tensor accepted, Tensor(b!) out, float scale, bool deq, int cores=7, "
-        "bool grouped=False, Tensor? row_offsets=None) -> ()");
+        "bool grouped=False, Tensor? row_offsets=None, int probe=0) -> ()");
 }
 TORCH_LIBRARY_IMPL(rgdr_v310_cube_fp16, PrivateUse1, m) {
   m.impl("run_", &cube_fp16);
@@ -109,5 +130,5 @@ TORCH_LIBRARY_IMPL(rgdr_v310_cube_fp16, Meta, m) {
   m.impl("run_", [](const at::Tensor&, const at::Tensor&, const at::Tensor&,
                      const at::Tensor&, const at::Tensor&, const at::Tensor&,
                      const at::Tensor&, const at::Tensor&, const at::Tensor&,
-                     double, bool, int64_t, bool, const std::optional<at::Tensor>&) {});
+                     double, bool, int64_t, bool, const std::optional<at::Tensor>&, int64_t) {});
 }

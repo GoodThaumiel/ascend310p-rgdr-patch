@@ -137,3 +137,64 @@ curl -fsS http://127.0.0.1:18083/v1/completions -H 'Content-Type: application/js
   -d '{"model":"rgdr-test","prompt":"Explain matrix multiplication in three sentences.","max_tokens":32,"temperature":0}'
 curl -fsS -X POST http://127.0.0.1:18083/stop_profile
 ```
+
+## 4. Grouped 流水探针
+
+0.1.6 增加三条独立的试验路径。服务继续使用 `baseline`。在目标镜像拉取代码并
+重新安装 Python 包，按第 2 节在新的目录（例如 `native-src/build-probes`）重建
+自定义算子，再将 `ASCEND310P_RGDR_PATCH_LIBRARY` 指向新库。
+
+| 变体 | 唯一主要改动 | 要比较的指标 |
+|---|---|---|
+| `batch-pack` | 分批清零、复制和转置 RHS 与 V，packing 的源码级 V barrier 从 51 降为 9 次/pair/token，额外 UB 3.5 KiB/core | Task Duration、Vector、Scalar |
+| `defer-write-wait` | 候选 state 提交 MTE3 后立即发 event，下一 token 的 Q/K packing 和 dot 广播之后才 wait | Task Duration、MTE3 与 Vector 的等待时序 |
+| `no-state-store` | 只留输出写回和 UB 内部 recurrence，跳过每个 token 的候选 state 写回。仅供独立诊断 | Task Duration、MTE3 |
+
+先检查三个变体在 B32 上的输出与 state。普通 decode 用 W1，MTP3 用 W4，
+MTP7 用 W8。W1 没有跨 token 的前一轮写回等待，可作为 `defer-write-wait` 的对照。
+默认 8 个 Q/K head、16 个 V head、7 个核。如果实际模型每 rank 为 16/32，
+将下面的 `RGDR_KEY_HEADS` 改成 16。
+
+```bash
+export RGDR_DEVICE=0
+export RGDR_KEY_HEADS=8
+for window in 1 4 8; do
+  for variant in batch-pack defer-write-wait no-state-store; do
+    python3 -m ascend310p_rgdr_patch.profile --check --graph \
+      --variant "$variant" --batch 32 --window "$window" --cores 7 \
+      --key-heads "$RGDR_KEY_HEADS" --device "$RGDR_DEVICE" || exit 1
+  done
+done
+```
+
+每组重放三次，与 grouped baseline 做 FP16 位模式比较。`no-state-store` 的输出仍与
+baseline 比较，GM state 则必须与调用前逐位一致。上述验证通过后，先抓 B32/W4
+的五组 profile，再用 W1 检查固定开销和写回等待，用 W8 检查 token 数增加后的趋势。
+原生路径从镜像加载 ACLNN 算子。若 OPP 注册失败，按第 3 节设置
+`ASCEND_CUSTOM_OPP_PATH`，并在新的进程中重跑对应组。
+
+```bash
+export RGDR_PROFILE_OUT=/tmp/rgdr-310p-pipeline
+mkdir -p "$RGDR_PROFILE_OUT"
+for window in 4 1 8; do
+  for variant in native baseline batch-pack defer-write-wait no-state-store; do
+    msprof --output="$RGDR_PROFILE_OUT/$variant-w$window" --ai-core=on --aic-metrics=PipeUtilization \
+      python3 -m ascend310p_rgdr_patch.profile --graph \
+      --variant "$variant" --batch 32 --window "$window" --cores 7 \
+      --key-heads "$RGDR_KEY_HEADS" --device "$RGDR_DEVICE" \
+      --warmup 20 --iterations 100 || exit 1
+  done
+done
+```
+
+五组使用同一 RNG seed 和同一组输入、槽号与接受长度。原生收到 FP32 gate，
+由 grouped 使用的同一份 FP16 gate 转换。state 在每次重放前通过独立操作恢复，
+只统计目标 kernel，按执行顺序取最后 100 条。原生名称含 `RecurrentGatedDeltaRuleV310`，
+grouped baseline 匹配 `rgdr_v310_cube_grouped_packed_fp16`，各探针匹配
+`rgdr_v310_cube_probe_batch_pack`、`rgdr_v310_cube_probe_defer_write_wait` 或
+`rgdr_v310_cube_probe_no_state_store`。16 个 Q/K head 的自定义 kernel 带 `_h16` 后缀。
+
+回传 commit、设备与软件栈、逐组 check 输出、`op_summary_*.csv`；如 profiler 支持，
+同时保留逐核 PMU 与流水事件。对比 Task Duration p50/p90、`aicore_time` 和
+Scalar、Vector、MTE1/2/3、MAC 的绝对时间。几个流水的时间可重叠。对
+`no-state-store` 观察到的差值包含写回传输和相关依赖的共同影响。

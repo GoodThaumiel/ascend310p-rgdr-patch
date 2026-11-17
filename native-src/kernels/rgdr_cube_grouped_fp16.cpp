@@ -19,6 +19,14 @@ constexpr uint32_t RHS = K_BLOCKS * FRACTAL;
 constexpr uint32_t RESULT = V * C0;
 constexpr uint32_t PAIR_STATE = PAIR * STATE;
 constexpr uint32_t PAIR_VALUE = PAIR * V;
+constexpr uint32_t PACK_BLOCKS = K / C0 > M_BLOCKS ? K / C0 : M_BLOCKS;
+
+enum Probe : uint32_t {
+    BASELINE = 0,
+    BATCH_PACK = 1,
+    DEFER_WRITE_WAIT = 2,
+    NO_STATE_STORE = 3,
+};
 
 template <HardEvent Event>
 __aicore__ inline void Sync()
@@ -28,7 +36,7 @@ __aicore__ inline void Sync()
     WaitFlag<Event>(id);
 }
 
-template <bool PACKED = false, uint32_t HK = 8>
+template <bool PACKED = false, uint32_t HK = 8, Probe PROBE = BASELINE>
 class GroupedFp16RGDR {
     static constexpr uint32_t HV = HK * PAIR;
 public:
@@ -69,7 +77,7 @@ public:
         pipe_.InitBuffer(gates_, 2 * window_ * HV * sizeof(half));
         pipe_.InitBuffer(rhs_, RHS * sizeof(half));
         pipe_.InitBuffer(valueTail_, RESULT * sizeof(half));
-        pipe_.InitBuffer(scratch_, FRACTAL * sizeof(half));
+        pipe_.InitBuffer(scratch_, (PROBE == BATCH_PACK ? PACK_BLOCKS : 1) * FRACTAL * sizeof(half));
         pipe_.InitBuffer(vectors_, (5 * V + PAIR_VALUE) * sizeof(half));
         pipe_.InitBuffer(gatherOffsets_, 3 * V * sizeof(uint32_t));
 
@@ -205,16 +213,33 @@ private:
         PipeBarrier<PIPE_V>();
         WholeReduceSum(dots, update, K, length, 1, 1, K / C0);
 
+        event_t writeDone{};
+        if constexpr (PROBE == DEFER_WRITE_WAIT) {
+            if (length > 1) {
+                writeDone = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_V));
+            }
+        }
         uint64_t outOffset = valueBase;
         for (uint32_t t = 0; t < length; ++t, outOffset += HV * V) {
             auto key = keys[t * K];
             PackRhs(key, queries[t * K]);
             // RHS packing can run while the previous candidate drains to GM.
-            if (t != 0) {
-                Sync<HardEvent::MTE3_V>();
+            if constexpr (PROBE == DEFER_WRITE_WAIT) {
+                // This broadcast touches vectors_[V:2*V], outside the output
+                // and states still being read by MTE3 from the previous token.
+                BroadcastLane(vectors[V], dots, t);
+                if (t != 0) {
+                    WaitFlag<HardEvent::MTE3_V>(writeDone);
+                }
+            } else {
+                if (t != 0) {
+                    Sync<HardEvent::MTE3_V>();
+                }
             }
             auto b2 = LoadRhs();
-            BroadcastLane(vectors[V], dots, t);
+            if constexpr (PROBE != DEFER_WRITE_WAIT) {
+                BroadcastLane(vectors[V], dots, t);
+            }
             for (uint32_t h = 0; h < PAIR; ++h) {
                 const uint32_t lane = head + h;
                 auto state = states[h * STATE];
@@ -228,7 +253,14 @@ private:
             b2_.FreeTensor(b2);
             Sync<HardEvent::V_MTE3>();
             DataCopy(out_[outOffset], output, PAIR_VALUE);
-            DataCopy(state_[offsets[t]], states, PAIR_STATE);
+            if constexpr (PROBE != NO_STATE_STORE) {
+                DataCopy(state_[offsets[t]], states, PAIR_STATE);
+            }
+            if constexpr (PROBE == DEFER_WRITE_WAIT) {
+                if (t + 1 < length) {
+                    SetFlag<HardEvent::MTE3_V>(writeDone);
+                }
+            }
         }
         Sync<HardEvent::MTE3_MTE2>();
     }
@@ -246,6 +278,10 @@ private:
     {
         auto scratch = scratch_.Get<half>();
         auto rhs = rhs_.Get<half>();
+        if constexpr (PROBE == BATCH_PACK) {
+            PackTiles<true, K / C0>(rhs, key, query);
+            return;
+        }
         Duplicate(scratch, static_cast<half>(0), FRACTAL);
         PipeBarrier<PIPE_V>();
         for (uint32_t block = 0; block < K / C0; ++block) {
@@ -261,6 +297,10 @@ private:
     {
         auto scratch = scratch_.Get<half>();
         auto tail = valueTail_.Get<half>();
+        if constexpr (PROBE == BATCH_PACK) {
+            PackTiles<false, M_BLOCKS>(tail, value, value);
+            return;
+        }
         Duplicate(scratch, static_cast<half>(0), FRACTAL);
         PipeBarrier<PIPE_V>();
         for (uint32_t block = 0; block < M_BLOCKS; ++block) {
@@ -269,6 +309,26 @@ private:
             Transpose(tail[block * FRACTAL], scratch);
             PipeBarrier<PIPE_V>();
         }
+    }
+
+    template <bool TWO_ROWS, uint32_t BLOCKS>
+    __aicore__ inline void PackTiles(LocalTensor<half> dst, LocalTensor<half> first, LocalTensor<half> second)
+    {
+        auto scratch = scratch_.Get<half>();
+        Duplicate(scratch, static_cast<half>(0), BLOCKS * FRACTAL);
+        PipeBarrier<PIPE_V>();
+        for (uint32_t block = 0; block < BLOCKS; ++block) {
+            auto tile = scratch[block * FRACTAL];
+            Adds(tile, first[block * C0], static_cast<half>(0), C0);
+            if constexpr (TWO_ROWS) {
+                Adds(tile[C0], second[block * C0], static_cast<half>(0), C0);
+            }
+        }
+        PipeBarrier<PIPE_V>();
+        for (uint32_t block = 0; block < BLOCKS; ++block) {
+            Transpose(dst[block * FRACTAL], scratch[block * FRACTAL]);
+        }
+        PipeBarrier<PIPE_V>();
     }
 
     __aicore__ inline LocalTensor<half> LoadRhs()
@@ -381,6 +441,63 @@ extern "C" __global__ __aicore__ void rgdr_v310_cube_grouped_fp16(
     op.Init(q, k, v, beta, gate, state, indices, accepted, out, batch, window, slots, scale);
     op.Process();
 }
+
+#define RUN_GROUPED_PROBE(HEADS, PROBE_KIND)                                                 \
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC);                                            \
+    GroupedFp16RGDR<true, HEADS, PROBE_KIND> op;                                               \
+    op.Init(q, k, v, beta, gate, state, indices, accepted, out, batch, window, slots, scale,    \
+            rowOffsets, tokens, stateStride);                                                 \
+    op.Process()
+
+extern "C" __global__ __aicore__ void rgdr_v310_cube_probe_batch_pack(
+    GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR gate, GM_ADDR state,
+    GM_ADDR indices, GM_ADDR accepted, GM_ADDR out, uint32_t batch, uint32_t window,
+    uint32_t slots, float scale, GM_ADDR rowOffsets, uint32_t tokens, uint64_t stateStride)
+{
+    RUN_GROUPED_PROBE(8, BATCH_PACK);
+}
+
+extern "C" __global__ __aicore__ void rgdr_v310_cube_probe_batch_pack_h16(
+    GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR gate, GM_ADDR state,
+    GM_ADDR indices, GM_ADDR accepted, GM_ADDR out, uint32_t batch, uint32_t window,
+    uint32_t slots, float scale, GM_ADDR rowOffsets, uint32_t tokens, uint64_t stateStride)
+{
+    RUN_GROUPED_PROBE(16, BATCH_PACK);
+}
+
+extern "C" __global__ __aicore__ void rgdr_v310_cube_probe_defer_write_wait(
+    GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR gate, GM_ADDR state,
+    GM_ADDR indices, GM_ADDR accepted, GM_ADDR out, uint32_t batch, uint32_t window,
+    uint32_t slots, float scale, GM_ADDR rowOffsets, uint32_t tokens, uint64_t stateStride)
+{
+    RUN_GROUPED_PROBE(8, DEFER_WRITE_WAIT);
+}
+
+extern "C" __global__ __aicore__ void rgdr_v310_cube_probe_defer_write_wait_h16(
+    GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR gate, GM_ADDR state,
+    GM_ADDR indices, GM_ADDR accepted, GM_ADDR out, uint32_t batch, uint32_t window,
+    uint32_t slots, float scale, GM_ADDR rowOffsets, uint32_t tokens, uint64_t stateStride)
+{
+    RUN_GROUPED_PROBE(16, DEFER_WRITE_WAIT);
+}
+
+extern "C" __global__ __aicore__ void rgdr_v310_cube_probe_no_state_store(
+    GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR gate, GM_ADDR state,
+    GM_ADDR indices, GM_ADDR accepted, GM_ADDR out, uint32_t batch, uint32_t window,
+    uint32_t slots, float scale, GM_ADDR rowOffsets, uint32_t tokens, uint64_t stateStride)
+{
+    RUN_GROUPED_PROBE(8, NO_STATE_STORE);
+}
+
+extern "C" __global__ __aicore__ void rgdr_v310_cube_probe_no_state_store_h16(
+    GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR gate, GM_ADDR state,
+    GM_ADDR indices, GM_ADDR accepted, GM_ADDR out, uint32_t batch, uint32_t window,
+    uint32_t slots, float scale, GM_ADDR rowOffsets, uint32_t tokens, uint64_t stateStride)
+{
+    RUN_GROUPED_PROBE(16, NO_STATE_STORE);
+}
+
+#undef RUN_GROUPED_PROBE
 
 extern "C" __global__ __aicore__ void rgdr_v310_cube_grouped_packed_fp16(
     GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR gate, GM_ADDR state,
