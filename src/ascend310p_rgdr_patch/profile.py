@@ -8,7 +8,14 @@ import torch
 
 from ascend310p_rgdr_patch import _DEFAULT_CORES, _LIBRARY_ENV, _MAX_CORES
 
-_PROBES = {"baseline": 0, "batch-pack": 1, "defer-write-wait": 2, "no-state-store": 3}
+_DIAGNOSTIC_PROBES = {
+    "no-gate-scale": 4,
+    "no-rank1": 5,
+    "no-rank1-broadcast": 6,
+    "no-rank1-mul": 7,
+    "no-rank1-add": 8,
+}
+_PROBES = {"baseline": 0, "batch-pack": 1, "defer-write-wait": 2, "no-state-store": 3, **_DIAGNOSTIC_PROBES}
 
 
 def _assert_bits(actual, expected, case):
@@ -51,6 +58,9 @@ def main():
         parser.error("batch must be in 1..1024, warmup non-negative and iterations positive")
     if args.check and args.variant == "native":
         parser.error("--check requires a grouped variant")
+    diagnostic = args.variant in _DIAGNOSTIC_PROBES
+    if args.check and diagnostic:
+        parser.error("this diagnostic changes the recurrence and cannot use --check")
     if args.reference_cores is not None and not args.check:
         parser.error("--reference-cores requires --check")
     native = args.variant == "native"
@@ -141,13 +151,11 @@ def main():
         return replay
 
     probe = _PROBES.get(args.variant, 0)
+    mode = "graph" if args.graph else "eager"
+    geometry = f"{args.variant} B{batch} W{window} H{key_heads} {mode}"
     if args.check:
         reference_cores = args.reference_cores or args.cores
-        mode = "graph" if args.graph else "eager"
-        case = (
-            f"{args.variant} B{batch} W{window} H{key_heads} "
-            f"cores={args.cores} reference_cores={reference_cores} {mode}"
-        )
+        case = f"{geometry} cores={args.cores} reference_cores={reference_cores}"
         out.fill_(float("nan"))
         launch(0, reference_cores)
         torch.npu.synchronize()
@@ -166,12 +174,22 @@ def main():
         print(f"PASS {case} repeats=3")
         return
 
+    launch_shape = "native tiling" if native else f"requested blockDim={args.cores}"
+    print(f"Profiling {geometry}, {launch_shape}", flush=True)
     run = prepare(probe)
+    if diagnostic:
+        state.copy_(initial)
+        out.fill_(float("nan"))
+        run()
+        torch.npu.synchronize()
+        if not out.cpu().isfinite().all() or not state.cpu().isfinite().all():
+            raise RuntimeError(f"{geometry} produced non-finite output or state")
+        _assert_bits(state[0], initial[0].cpu(), f"{geometry} reserved slot")
     for _ in range(args.warmup + args.iterations):
         state.copy_(initial)
         run()
     torch.npu.synchronize()
-    print(f"Completed {args.warmup + args.iterations} launches of {args.variant} B{batch} W{window} H{key_heads}")
+    print(f"Completed {args.warmup + args.iterations} launches of {geometry}, {launch_shape}")
 
 
 if __name__ == "__main__":

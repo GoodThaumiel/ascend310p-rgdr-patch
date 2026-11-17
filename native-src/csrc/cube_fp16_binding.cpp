@@ -19,6 +19,16 @@
 #include "aclrtlaunch_rgdr_v310_cube_probe_defer_write_wait_h16.h"
 #include "aclrtlaunch_rgdr_v310_cube_probe_no_state_store.h"
 #include "aclrtlaunch_rgdr_v310_cube_probe_no_state_store_h16.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_no_gate_scale.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_no_gate_scale_h16.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_no_rank1.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_no_rank1_h16.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_no_rank1_broadcast.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_no_rank1_broadcast_h16.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_no_rank1_mul.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_no_rank1_mul_h16.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_no_rank1_add.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_no_rank1_add_h16.h"
 
 namespace {
 void cube_fp16(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
@@ -27,8 +37,9 @@ void cube_fp16(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
                double scale, bool deq, int64_t cores, bool grouped,
                const std::optional<at::Tensor>& row_offsets, int64_t probe) {
   TORCH_CHECK(!grouped || !deq, "grouped RGDR uses one L0C drain and scales in UB");
-  TORCH_CHECK(probe >= 0 && probe <= 3 && (probe == 0 || (grouped && row_offsets)),
-              "RGDR probes 1–3 require packed grouped inputs");
+  TORCH_CHECK(probe >= 0 && probe <= 8, "Unsupported RGDR probe ID (expected 0..8)");
+  TORCH_CHECK(probe == 0 || (grouped && row_offsets),
+              "RGDR probes require packed grouped inputs");
   TORCH_CHECK(q.device().type() == c10::DeviceType::PrivateUse1, "NPU tensors required");
   for (const auto& tensor : {q, k, v, beta, gate, indices, accepted, out}) {
     TORCH_CHECK(tensor.device() == q.device() && tensor.is_contiguous(),
@@ -90,15 +101,26 @@ void cube_fp16(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
 #define RGDR_PACKED_ARGS \
   RGDR_ARGS, row_offsets->data_ptr(), static_cast<uint32_t>(tokens), \
       static_cast<uint64_t>(state.stride(0))
-  if (probe == 1) {
-    result = key_heads == 16 ? aclrtlaunch_rgdr_v310_cube_probe_batch_pack_h16(RGDR_PACKED_ARGS)
-                             : aclrtlaunch_rgdr_v310_cube_probe_batch_pack(RGDR_PACKED_ARGS);
-  } else if (probe == 2) {
-    result = key_heads == 16 ? aclrtlaunch_rgdr_v310_cube_probe_defer_write_wait_h16(RGDR_PACKED_ARGS)
-                             : aclrtlaunch_rgdr_v310_cube_probe_defer_write_wait(RGDR_PACKED_ARGS);
-  } else if (probe == 3) {
-    result = key_heads == 16 ? aclrtlaunch_rgdr_v310_cube_probe_no_state_store_h16(RGDR_PACKED_ARGS)
-                             : aclrtlaunch_rgdr_v310_cube_probe_no_state_store(RGDR_PACKED_ARGS);
+  if (probe != 0) {
+    switch (probe) {
+#define RGDR_PROBE_CASE(ID, NAME) \
+      case ID: \
+        result = key_heads == 16 \
+            ? aclrtlaunch_rgdr_v310_cube_probe_##NAME##_h16(RGDR_PACKED_ARGS) \
+            : aclrtlaunch_rgdr_v310_cube_probe_##NAME(RGDR_PACKED_ARGS); \
+        break
+      RGDR_PROBE_CASE(1, batch_pack);
+      RGDR_PROBE_CASE(2, defer_write_wait);
+      RGDR_PROBE_CASE(3, no_state_store);
+      RGDR_PROBE_CASE(4, no_gate_scale);
+      RGDR_PROBE_CASE(5, no_rank1);
+      RGDR_PROBE_CASE(6, no_rank1_broadcast);
+      RGDR_PROBE_CASE(7, no_rank1_mul);
+      RGDR_PROBE_CASE(8, no_rank1_add);
+#undef RGDR_PROBE_CASE
+      default:
+        TORCH_CHECK(false, "Unsupported RGDR probe ID");
+    }
   } else if (row_offsets && key_heads == 16) {
     result = aclrtlaunch_rgdr_v310_cube_grouped_packed_fp16_h16(
         RGDR_ARGS, row_offsets->data_ptr(), static_cast<uint32_t>(tokens),

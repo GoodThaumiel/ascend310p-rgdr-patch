@@ -273,3 +273,57 @@ done
 服务启动时 worker 日志应显示 `cores=8`，可在设备 trace 中核对 Block Dim。
 对照 c7 时，在启动前设置 `ASCEND310P_RGDR_PATCH_CORES=7` 并重新捕图。
 第 3 节的普通 decode 图重放 smoke 也读取该变量。
+
+## 6. State gate 与 rank-1 update 消融
+
+使用 `./setup.sh` 编译并安装 0.1.10，然后按其输出加载新 build 的 `env.sh`。
+本轮用 B32 / H8 / c8、同卡、同采集配置。对照与所有探针使用同一个新构建，
+每组独立抓取。先用 `baseline` 做图重放逐位自对照，再测 W1/W2/W4/W8 的增长曲线。
+
+| 探针 | 执行变化 |
+|---|---|
+| `no-gate-scale` | 省去 128×128 state 的 gate 乘法。在源码中保留 gate 准备。 |
+| `no-rank1` | 省去生成并叠加 rank-1 矩阵的三步。保留输出的 `delta × (k·q)` 修正。 |
+| `no-rank1-broadcast` | 省去展开 delta 的 Broadcast。后续乘法读取初始化过的 state 矩阵，保留乘法形状和载入量。 |
+| `no-rank1-mul` | 将展开后的 delta 直接用于 state 加法，省去 rank-1 矩阵乘 key 的 Mul。 |
+| `no-rank1-add` | 将 rank-1 Mul 的结果直接写至 state UB，省去原 state 与该结果的 Add。 |
+
+五个探针的递推都与 baseline 不同，只通过 profiling 入口运行。每次测量前自动
+检查一次输出和 state 有限、保留槽 0 逐位不变。探针继续写回所有候选 state。
+编译后的调度及 UB 读写依赖可能随改动变化。用 `no-rank1` 估计整段影响，
+用三个单阶段变体定位变化主要发生在哪段，分别与同 W baseline 比较。各差值
+不可直接视为指令时长或相加。
+
+```bash
+export RGDR_DEVICE=0
+export RGDR_KEY_HEADS=8
+export RGDR_PROFILE_OUT=/tmp/rgdr-310p-vector-c8
+python3 -m ascend310p_rgdr_patch.profile --check --graph --variant baseline \
+  --batch 32 --window 4 --key-heads "$RGDR_KEY_HEADS" --cores 8 --device "$RGDR_DEVICE"
+
+profile_rgdr() {
+  local variant=$1 window=$2
+  msprof --output="$RGDR_PROFILE_OUT/$variant-w$window" --ai-core=on --aic-metrics=PipeUtilization \
+    python3 -m ascend310p_rgdr_patch.profile --graph --variant "$variant" \
+    --batch 32 --window "$window" --key-heads "$RGDR_KEY_HEADS" --cores 8 \
+    --device "$RGDR_DEVICE" --warmup 20 --iterations 100
+}
+mkdir -p "$RGDR_PROFILE_OUT"
+for window in 1 2 4 8; do
+  for variant in baseline no-gate-scale no-rank1; do
+    profile_rgdr "$variant" "$window" || exit 1
+  done
+done
+for window in 4 8; do
+  for variant in no-rank1-broadcast no-rank1-mul no-rank1-add; do
+    profile_rgdr "$variant" "$window" || exit 1
+  done
+done
+```
+
+回传脚本打印的请求核数、目标 kernel 的 CSV `Block Num`（应为 8）、
+Task Duration p50/p90、Vector、Scalar、MTE1/2/3 和 MAC。目标符号为
+`rgdr_v310_cube_grouped_packed_fp16` 或 `rgdr_v310_cube_probe_<variant>`，
+其中 variant 名的连字符换成下划线。H16 另外带 `_h16`。按时间排序取目标
+kernel 的最后 100 条。若观察到几个微秒的差异，重抓对应的 baseline 和探针
+再判断重现性。

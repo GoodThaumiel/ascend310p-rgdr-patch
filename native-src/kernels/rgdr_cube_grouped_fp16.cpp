@@ -26,6 +26,11 @@ enum Probe : uint32_t {
     BATCH_PACK = 1,
     DEFER_WRITE_WAIT = 2,
     NO_STATE_STORE = 3,
+    NO_GATE_SCALE = 4,
+    NO_RANK1 = 5,
+    NO_RANK1_BROADCAST = 6,
+    NO_RANK1_MUL = 7,
+    NO_RANK1_ADD = 8,
 };
 
 template <HardEvent Event>
@@ -236,7 +241,9 @@ private:
                 auto state = states[h * STATE];
                 BroadcastLane(vectors[2 * V], gates[t * HV], lane);
                 BroadcastLane(vectors[3 * V], negativeBeta[t * HV], lane);
-                Mul(state, state, vectors[2 * V], K, V, {1, 1, 1, K / C0, K / C0, 0});
+                if constexpr (PROBE != NO_GATE_SCALE) {
+                    Mul(state, state, vectors[2 * V], K, V, {1, 1, 1, K / C0, K / C0, 0});
+                }
                 PackValue(values[t * PAIR_VALUE + h * V]);
                 auto c = Matvec(state, b2);
                 Update(state, key, c, output[h * V]);
@@ -388,15 +395,27 @@ private:
         Mul(delta, delta, vectors[3 * V], V);
         PipeBarrier<PIPE_V>();
         auto update = update_.Get<half>();
-        uint32_t shape[2] = {V, K};
-        uint32_t deltaShape[2] = {V, 1};
-        Broadcast<half, 2, 1>(update, delta, shape, deltaShape);
+        if constexpr (PROBE != NO_RANK1 && PROBE != NO_RANK1_BROADCAST) {
+            uint32_t shape[2] = {V, K};
+            uint32_t deltaShape[2] = {V, 1};
+            Broadcast<half, 2, 1>(update, delta, shape, deltaShape);
+        }
         Mul(scratch, delta, vectors[V], V);
         PipeBarrier<PIPE_V>();
-        Mul(update, update, key, K, V, {1, 1, 1, K / C0, K / C0, 0});
+        if constexpr (PROBE == NO_RANK1_BROADCAST) {
+            // Use a defined 128x128 source for the same strided multiply.
+            Mul(update, state, key, K, V, {1, 1, 1, K / C0, K / C0, 0});
+        } else if constexpr (PROBE == NO_RANK1_ADD) {
+            // Make the whole multiply observable in the usual state writeback.
+            Mul(state, update, key, K, V, {1, 1, 1, K / C0, K / C0, 0});
+        } else if constexpr (PROBE != NO_RANK1 && PROBE != NO_RANK1_MUL) {
+            Mul(update, update, key, K, V, {1, 1, 1, K / C0, K / C0, 0});
+        }
         Add(output, output, scratch, V);
         PipeBarrier<PIPE_V>();
-        Add(state, state, update, STATE);
+        if constexpr (PROBE != NO_RANK1 && PROBE != NO_RANK1_ADD) {
+            Add(state, state, update, STATE);
+        }
         Muls(output, output, scale_, V);
         PipeBarrier<PIPE_V>();
     }
@@ -481,6 +500,86 @@ extern "C" __global__ __aicore__ void rgdr_v310_cube_probe_no_state_store_h16(
     uint32_t slots, float scale, GM_ADDR rowOffsets, uint32_t tokens, uint64_t stateStride)
 {
     RUN_GROUPED_PROBE(16, NO_STATE_STORE);
+}
+
+extern "C" __global__ __aicore__ void rgdr_v310_cube_probe_no_gate_scale(
+    GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR gate, GM_ADDR state,
+    GM_ADDR indices, GM_ADDR accepted, GM_ADDR out, uint32_t batch, uint32_t window,
+    uint32_t slots, float scale, GM_ADDR rowOffsets, uint32_t tokens, uint64_t stateStride)
+{
+    RUN_GROUPED_PROBE(8, NO_GATE_SCALE);
+}
+
+extern "C" __global__ __aicore__ void rgdr_v310_cube_probe_no_gate_scale_h16(
+    GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR gate, GM_ADDR state,
+    GM_ADDR indices, GM_ADDR accepted, GM_ADDR out, uint32_t batch, uint32_t window,
+    uint32_t slots, float scale, GM_ADDR rowOffsets, uint32_t tokens, uint64_t stateStride)
+{
+    RUN_GROUPED_PROBE(16, NO_GATE_SCALE);
+}
+
+extern "C" __global__ __aicore__ void rgdr_v310_cube_probe_no_rank1(
+    GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR gate, GM_ADDR state,
+    GM_ADDR indices, GM_ADDR accepted, GM_ADDR out, uint32_t batch, uint32_t window,
+    uint32_t slots, float scale, GM_ADDR rowOffsets, uint32_t tokens, uint64_t stateStride)
+{
+    RUN_GROUPED_PROBE(8, NO_RANK1);
+}
+
+extern "C" __global__ __aicore__ void rgdr_v310_cube_probe_no_rank1_h16(
+    GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR gate, GM_ADDR state,
+    GM_ADDR indices, GM_ADDR accepted, GM_ADDR out, uint32_t batch, uint32_t window,
+    uint32_t slots, float scale, GM_ADDR rowOffsets, uint32_t tokens, uint64_t stateStride)
+{
+    RUN_GROUPED_PROBE(16, NO_RANK1);
+}
+
+extern "C" __global__ __aicore__ void rgdr_v310_cube_probe_no_rank1_broadcast(
+    GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR gate, GM_ADDR state,
+    GM_ADDR indices, GM_ADDR accepted, GM_ADDR out, uint32_t batch, uint32_t window,
+    uint32_t slots, float scale, GM_ADDR rowOffsets, uint32_t tokens, uint64_t stateStride)
+{
+    RUN_GROUPED_PROBE(8, NO_RANK1_BROADCAST);
+}
+
+extern "C" __global__ __aicore__ void rgdr_v310_cube_probe_no_rank1_broadcast_h16(
+    GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR gate, GM_ADDR state,
+    GM_ADDR indices, GM_ADDR accepted, GM_ADDR out, uint32_t batch, uint32_t window,
+    uint32_t slots, float scale, GM_ADDR rowOffsets, uint32_t tokens, uint64_t stateStride)
+{
+    RUN_GROUPED_PROBE(16, NO_RANK1_BROADCAST);
+}
+
+extern "C" __global__ __aicore__ void rgdr_v310_cube_probe_no_rank1_mul(
+    GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR gate, GM_ADDR state,
+    GM_ADDR indices, GM_ADDR accepted, GM_ADDR out, uint32_t batch, uint32_t window,
+    uint32_t slots, float scale, GM_ADDR rowOffsets, uint32_t tokens, uint64_t stateStride)
+{
+    RUN_GROUPED_PROBE(8, NO_RANK1_MUL);
+}
+
+extern "C" __global__ __aicore__ void rgdr_v310_cube_probe_no_rank1_mul_h16(
+    GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR gate, GM_ADDR state,
+    GM_ADDR indices, GM_ADDR accepted, GM_ADDR out, uint32_t batch, uint32_t window,
+    uint32_t slots, float scale, GM_ADDR rowOffsets, uint32_t tokens, uint64_t stateStride)
+{
+    RUN_GROUPED_PROBE(16, NO_RANK1_MUL);
+}
+
+extern "C" __global__ __aicore__ void rgdr_v310_cube_probe_no_rank1_add(
+    GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR gate, GM_ADDR state,
+    GM_ADDR indices, GM_ADDR accepted, GM_ADDR out, uint32_t batch, uint32_t window,
+    uint32_t slots, float scale, GM_ADDR rowOffsets, uint32_t tokens, uint64_t stateStride)
+{
+    RUN_GROUPED_PROBE(8, NO_RANK1_ADD);
+}
+
+extern "C" __global__ __aicore__ void rgdr_v310_cube_probe_no_rank1_add_h16(
+    GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR gate, GM_ADDR state,
+    GM_ADDR indices, GM_ADDR accepted, GM_ADDR out, uint32_t batch, uint32_t window,
+    uint32_t slots, float scale, GM_ADDR rowOffsets, uint32_t tokens, uint64_t stateStride)
+{
+    RUN_GROUPED_PROBE(16, NO_RANK1_ADD);
 }
 
 #undef RUN_GROUPED_PROBE
