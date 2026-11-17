@@ -11,6 +11,22 @@ from ascend310p_rgdr_patch import _LIBRARY_ENV
 _PROBES = {"baseline": 0, "batch-pack": 1, "defer-write-wait": 2, "no-state-store": 3}
 
 
+def _assert_bits(actual, expected, case):
+    actual = actual.cpu()
+    actual_bits = actual.view(torch.int16)
+    expected_bits = expected.view(torch.int16)
+    if torch.equal(actual_bits, expected_bits):
+        return
+
+    mismatches = (actual_bits != expected_bits).nonzero()
+    first = tuple(mismatches[0].tolist())
+    raise AssertionError(
+        f"{case}: {len(mismatches)}/{actual.numel()} FP16 elements differ; first={first}; "
+        f"actual={actual[first].item():.8g} (0x{actual_bits[first].item() & 0xFFFF:04x}), "
+        f"expected={expected[first].item():.8g} (0x{expected_bits[first].item() & 0xFFFF:04x})"
+    )
+
+
 @torch.inference_mode()
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -27,8 +43,8 @@ def main():
     args = parser.parse_args()
     if not 1 <= args.batch <= 1024 or args.warmup < 0 or args.iterations < 1:
         parser.error("batch must be in 1..1024, warmup non-negative and iterations positive")
-    if args.check and args.variant in {"native", "baseline"}:
-        parser.error("--check requires a probe variant")
+    if args.check and args.variant == "native":
+        parser.error("--check requires a grouped variant")
     native = args.variant == "native"
     if native:
         from vllm_ascend.utils import bootstrap_custom_op_env
@@ -126,13 +142,15 @@ def main():
             raise RuntimeError("Grouped baseline did not produce finite output")
         expected_state = (initial if args.variant == "no-state-store" else state).cpu()
         run = prepare(probe)
-        for _ in range(3):
+        for repeat in range(1, 4):
             state.copy_(initial)
             out.fill_(float("nan"))
             run()
             torch.npu.synchronize()
-            torch.testing.assert_close(out.cpu().view(torch.int16), expected_out.view(torch.int16))
-            torch.testing.assert_close(state.cpu().view(torch.int16), expected_state.view(torch.int16))
+            mode = "graph" if args.graph else "eager"
+            case = f"{args.variant} B{batch} W{window} H{key_heads} cores={args.cores} {mode} repeat={repeat}"
+            _assert_bits(out, expected_out, f"{case} output")
+            _assert_bits(state, expected_state, f"{case} state")
         print(f"PASS {args.variant} B{batch} W{window} H{key_heads} cores={args.cores} repeats=3")
         return
 

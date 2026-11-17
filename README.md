@@ -140,14 +140,14 @@ curl -fsS -X POST http://127.0.0.1:18083/stop_profile
 
 ## 4. Grouped 流水探针
 
-0.1.6 增加三条独立的试验路径。服务继续使用 `baseline`。在目标镜像拉取代码并
+流水探针提供三条独立的试验路径。服务继续使用 `baseline`。在目标镜像拉取代码并
 重新安装 Python 包，按第 2 节在新的目录（例如 `native-src/build-probes`）重建
 自定义算子，再将 `ASCEND310P_RGDR_PATCH_LIBRARY` 指向新库。
 
 | 变体 | 唯一主要改动 | 要比较的指标 |
 |---|---|---|
 | `batch-pack` | 分批清零、复制和转置 RHS 与 V，packing 的源码级 V barrier 从 51 降为 9 次/pair/token，额外 UB 3.5 KiB/core | Task Duration、Vector、Scalar |
-| `defer-write-wait` | 候选 state 提交 MTE3 后立即发 event，下一 token 的 Q/K packing 和 dot 广播之后才 wait | Task Duration、MTE3 与 Vector 的等待时序 |
+| `defer-write-wait` | 下一 token 先做 Q/K packing 和 dot 广播，再用相邻的 SetFlag/WaitFlag 等待前一 token 写回，随后才复用 state 和输出 UB | Task Duration、MTE3 与 Vector 的等待时序 |
 | `no-state-store` | 只留输出写回和 UB 内部 recurrence，跳过每个 token 的候选 state 写回。仅供独立诊断 | Task Duration、MTE3 |
 
 先检查三个变体在 B32 上的输出与 state。普通 decode 用 W1，MTP3 用 W4，
@@ -155,9 +155,25 @@ MTP7 用 W8。W1 没有跨 token 的前一轮写回等待，可作为 `defer-wri
 默认 8 个 Q/K head、16 个 V head、7 个核。如果实际模型每 rank 为 16/32，
 将下面的 `RGDR_KEY_HEADS` 改成 16。
 
+0.1.6 上机时，B32/W4/H8 的 `defer-write-wait` 图重放在候选 state 逐位比对失败。
+0.1.7 将跨 token 的事件改回成对发出和等待，保留前移的 dot 广播。重建后先重测
+这个场景的 eager 与图重放，并跑一次 baseline 自对照。以下通过后继续矩阵。
+
 ```bash
 export RGDR_DEVICE=0
 export RGDR_KEY_HEADS=8
+python3 -m ascend310p_rgdr_patch.profile --check --variant defer-write-wait \
+  --window 4 --device "$RGDR_DEVICE" --key-heads "$RGDR_KEY_HEADS"
+for variant in baseline defer-write-wait; do
+  python3 -m ascend310p_rgdr_patch.profile --check --graph --variant "$variant" \
+    --window 4 --device "$RGDR_DEVICE" --key-heads "$RGDR_KEY_HEADS" || exit 1
+done
+```
+
+如果再次失败，回传含 eager/graph、repeat、首个索引以及 FP16 值和位模式的报错。
+每条命令独立启动进程。
+
+```bash
 for window in 1 4 8; do
   for variant in batch-pack defer-write-wait no-state-store; do
     python3 -m ascend310p_rgdr_patch.profile --check --graph \

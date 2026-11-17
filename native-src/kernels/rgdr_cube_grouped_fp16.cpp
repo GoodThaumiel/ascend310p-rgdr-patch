@@ -213,28 +213,19 @@ private:
         PipeBarrier<PIPE_V>();
         WholeReduceSum(dots, update, K, length, 1, 1, K / C0);
 
-        event_t writeDone{};
-        if constexpr (PROBE == DEFER_WRITE_WAIT) {
-            if (length > 1) {
-                writeDone = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_V));
-            }
-        }
         uint64_t outOffset = valueBase;
         for (uint32_t t = 0; t < length; ++t, outOffset += HV * V) {
             auto key = keys[t * K];
             PackRhs(key, queries[t * K]);
             // RHS packing can run while the previous candidate drains to GM.
             if constexpr (PROBE == DEFER_WRITE_WAIT) {
-                // This broadcast touches vectors_[V:2*V], outside the output
-                // and states still being read by MTE3 from the previous token.
+                // This broadcast uses scratch disjoint from the previous
+                // token's output and state DMA sources.
                 BroadcastLane(vectors[V], dots, t);
-                if (t != 0) {
-                    WaitFlag<HardEvent::MTE3_V>(writeDone);
-                }
-            } else {
-                if (t != 0) {
-                    Sync<HardEvent::MTE3_V>();
-                }
+            }
+            if (t != 0) {
+                // Keep SetFlag and WaitFlag adjacent before source UB reuse.
+                Sync<HardEvent::MTE3_V>();
             }
             auto b2 = LoadRhs();
             if constexpr (PROBE != DEFER_WRITE_WAIT) {
@@ -255,11 +246,6 @@ private:
             DataCopy(out_[outOffset], output, PAIR_VALUE);
             if constexpr (PROBE != NO_STATE_STORE) {
                 DataCopy(state_[offsets[t]], states, PAIR_STATE);
-            }
-            if constexpr (PROBE == DEFER_WRITE_WAIT) {
-                if (t + 1 < length) {
-                    SetFlag<HardEvent::MTE3_V>(writeDone);
-                }
             }
         }
         Sync<HardEvent::MTE3_MTE2>();
