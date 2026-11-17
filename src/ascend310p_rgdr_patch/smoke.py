@@ -7,7 +7,7 @@ from unittest.mock import Mock
 
 import torch
 
-from ascend310p_rgdr_patch import _KEY_HEAD_COUNTS, _wrap, register
+from ascend310p_rgdr_patch import _KEY_HEAD_COUNTS, _configured_cores, _wrap, register
 
 
 def _cpu_reference(q, k, v, gate, beta, initial, slots):
@@ -62,7 +62,8 @@ def main():
 
     native = grouped.__wrapped__
     launch = Mock(wraps=torch.ops.rgdr_v310_cube_fp16.run_.default)
-    grouped = _wrap(native, gdn_310.l2norm_310p, launch, "decode", torch)
+    cores = _configured_cores()
+    grouped = _wrap(native, gdn_310.l2norm_310p, launch, "decode", torch, cores=cores)
     rng = torch.Generator().manual_seed(310023)
 
     def random(shape, scale):
@@ -118,7 +119,7 @@ def main():
             launch.assert_called_once()
             _check_result(args.reference, batch, active, output, grouped_state, initial, native, inputs, tail)
         if args.graph:
-            print(f"B{batch} W1 ACLGraph capture/replay PASS", flush=True)
+            print(f"B{batch} W1 cores={cores} ACLGraph capture/replay PASS", flush=True)
 
 
 def _check_result(reference_mode, batch, active, output, grouped_state, initial, native, inputs, tail):

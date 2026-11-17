@@ -6,7 +6,7 @@ import os
 
 import torch
 
-from ascend310p_rgdr_patch import _LIBRARY_ENV
+from ascend310p_rgdr_patch import _DEFAULT_CORES, _LIBRARY_ENV, _MAX_CORES
 
 _PROBES = {"baseline": 0, "batch-pack": 1, "defer-write-wait": 2, "no-state-store": 3}
 
@@ -34,7 +34,13 @@ def main():
     parser.add_argument("--batch", type=int, default=32)
     parser.add_argument("--window", type=int, choices=range(1, 9), default=4)
     parser.add_argument("--key-heads", type=int, choices=(8, 16), default=8)
-    parser.add_argument("--cores", type=int, choices=range(1, 8), default=7)
+    parser.add_argument("--cores", type=int, choices=range(1, _MAX_CORES + 1), default=_DEFAULT_CORES)
+    parser.add_argument(
+        "--reference-cores",
+        type=int,
+        choices=range(1, _MAX_CORES + 1),
+        help="grouped baseline core count for --check (defaults to --cores)",
+    )
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=100)
@@ -45,6 +51,8 @@ def main():
         parser.error("batch must be in 1..1024, warmup non-negative and iterations positive")
     if args.check and args.variant == "native":
         parser.error("--check requires a grouped variant")
+    if args.reference_cores is not None and not args.check:
+        parser.error("--reference-cores requires --check")
     native = args.variant == "native"
     if native:
         from vllm_ascend.utils import bootstrap_custom_op_env
@@ -97,7 +105,7 @@ def main():
         gate_fp32 = g.float()
         flat_slots = slots.view(-1)
 
-    def launch(probe):
+    def launch(probe, cores):
         if native:
             return torch.ops._C_ascend.npu_recurrent_gated_delta_rule_310(
                 query=q,
@@ -112,19 +120,19 @@ def main():
                 num_accepted_tokens=accepted if window > 1 else None,
                 scale_value=scale,
             )
-        op(q, k, v, beta, g, state, slots, accepted, out, scale, False, args.cores, True, offsets, probe)
+        op(q, k, v, beta, g, state, slots, accepted, out, scale, False, cores, True, offsets, probe)
         return out
 
     def prepare(probe):
         if not args.graph:
-            return lambda: launch(probe)
+            return lambda: launch(probe, args.cores)
         state.copy_(initial)
-        launch(probe)
+        launch(probe, args.cores)
         torch.npu.synchronize()
         state.copy_(initial)
         graph = torch.npu.NPUGraph()
         with torch.npu.graph(graph):
-            graph_output = launch(probe)
+            graph_output = launch(probe, args.cores)
 
         def replay():
             graph.replay()
@@ -134,8 +142,14 @@ def main():
 
     probe = _PROBES.get(args.variant, 0)
     if args.check:
+        reference_cores = args.reference_cores or args.cores
+        mode = "graph" if args.graph else "eager"
+        case = (
+            f"{args.variant} B{batch} W{window} H{key_heads} "
+            f"cores={args.cores} reference_cores={reference_cores} {mode}"
+        )
         out.fill_(float("nan"))
-        launch(0)
+        launch(0, reference_cores)
         torch.npu.synchronize()
         expected_out = out.cpu()
         if not expected_out.isfinite().all():
@@ -147,11 +161,9 @@ def main():
             out.fill_(float("nan"))
             run()
             torch.npu.synchronize()
-            mode = "graph" if args.graph else "eager"
-            case = f"{args.variant} B{batch} W{window} H{key_heads} cores={args.cores} {mode} repeat={repeat}"
-            _assert_bits(out, expected_out, f"{case} output")
-            _assert_bits(state, expected_state, f"{case} state")
-        print(f"PASS {args.variant} B{batch} W{window} H{key_heads} cores={args.cores} repeats=3")
+            _assert_bits(out, expected_out, f"{case} repeat={repeat} output")
+            _assert_bits(state, expected_state, f"{case} repeat={repeat} state")
+        print(f"PASS {case} repeats=3")
         return
 
     run = prepare(probe)

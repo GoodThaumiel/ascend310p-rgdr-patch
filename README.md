@@ -214,3 +214,43 @@ grouped baseline 匹配 `rgdr_v310_cube_grouped_packed_fp16`，各探针匹配
 同时保留逐核 PMU 与流水事件。对比 Task Duration p50/p90、`aicore_time` 和
 Scalar、Vector、MTE1/2/3、MAC 的绝对时间。几个流水的时间可重叠。对
 `no-state-store` 观察到的差值包含写回传输和相关依赖的共同影响。
+
+## 5. Grouped 7 核与 8 核对照
+
+0.1.8 支持 `blockDim=8`。按第 2 节重编自定义 `.so`，并重新安装 Python 包。
+服务和脚本默认仍为 7 核。核内计算和任务编号沿用当前实现，
+每个 block 以实际 `GetBlockNum()` 为步长分配 `(request, head-pair)`。
+
+先选实际的每 rank head 数。TP2 用 `RGDR_KEY_HEADS=8`，
+attention TP1 + DP2 + EP2 用 `RGDR_KEY_HEADS=16`。
+
+```bash
+export RGDR_DEVICE=0
+export RGDR_KEY_HEADS=8
+python3 -m ascend310p_rgdr_patch.profile --check --variant baseline \
+  --cores 8 --reference-cores 7 --batch 32 --window 4 \
+  --key-heads "$RGDR_KEY_HEADS" --device "$RGDR_DEVICE"
+for window in 1 4 8; do
+  python3 -m ascend310p_rgdr_patch.profile --check --graph --variant baseline \
+    --cores 8 --reference-cores 7 --batch 32 --window "$window" \
+    --key-heads "$RGDR_KEY_HEADS" --device "$RGDR_DEVICE" || exit 1
+done
+```
+
+通过后，在同卡抓 B32 / MTP3 的 c7/c8，各取最后 100 条 grouped kernel。
+记录 Block Dim 和 Task Duration p50/p90，算子符号名与第 4 节相同。
+可将 `--window 4` 改成 `--window 8` 补测 MTP7。
+
+```bash
+for cores in 7 8; do
+  msprof --output="/tmp/rgdr-310p-c$cores-w4" --ai-core=on --aic-metrics=PipeUtilization \
+    python3 -m ascend310p_rgdr_patch.profile --graph --variant baseline \
+    --cores "$cores" --batch 32 --window 4 \
+    --key-heads "$RGDR_KEY_HEADS" --device "$RGDR_DEVICE" \
+    --warmup 20 --iterations 100 || exit 1
+done
+```
+
+验证服务时，在启动前设置 `ASCEND310P_RGDR_PATCH_CORES=8` 环境变量。
+第 3 节的普通 decode 图重放 smoke 也读取该变量。服务重启并重新捕图后，
+worker 日志应显示 `cores=8`，可在设备 trace 中核对 blockDim。

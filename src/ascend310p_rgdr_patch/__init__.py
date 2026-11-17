@@ -13,6 +13,7 @@ from pathlib import Path
 _LOG = logging.getLogger(__name__)
 _LIBRARY_ENV = "ASCEND310P_RGDR_PATCH_LIBRARY"
 _MODE_ENV = "ASCEND310P_RGDR_PATCH_MODE"
+_CORES_ENV = "ASCEND310P_RGDR_PATCH_CORES"
 _DIAGNOSTICS_ENV = "ASCEND310P_RGDR_PATCH_DIAGNOSTICS"
 _SUPPORTED_VERSION = re.compile(r"0\.23\.0(?:rc1)?(?:[.+-].+)?")
 _GDN_MODULE = "vllm_ascend._310p.ops.fla.gdn_310"
@@ -33,7 +34,8 @@ _KEY_HEAD_COUNTS = (8, 16)
 _HEAD_DIM = 128
 _MAX_BATCH = 1024
 _MAX_WINDOW = 8
-_CORES = 7
+_DEFAULT_CORES = 7
+_MAX_CORES = 8
 
 
 def _geometry_mismatch(q, k, v, g, beta, state, offsets, slots, accepted, torch):
@@ -92,7 +94,7 @@ def _tensor_metadata(tensor):
     return (tuple(tensor.shape), str(tensor.dtype), str(tensor.device))
 
 
-def _wrap(original, normalize, grouped, mode, torch, *, diagnostics=False, is_capturing=None):
+def _wrap(original, normalize, grouped, mode, torch, *, cores=_DEFAULT_CORES, diagnostics=False, is_capturing=None):
     logged_routes = set()
 
     @wraps(original)
@@ -181,7 +183,7 @@ def _wrap(original, normalize, grouped, mode, torch, *, diagnostics=False, is_ca
             out.squeeze(0),
             _HEAD_DIM**-0.5,
             False,
-            _CORES,
+            cores,
             True,
             offsets,
         )
@@ -189,6 +191,16 @@ def _wrap(original, normalize, grouped, mode, torch, *, diagnostics=False, is_ca
 
     replacement._ascend310p_grouped_rgdr = True
     return replacement
+
+
+def _configured_cores():
+    try:
+        cores = int(os.getenv(_CORES_ENV, str(_DEFAULT_CORES)))
+    except ValueError as error:
+        raise ValueError(f"{_CORES_ENV} must be an integer in [1, {_MAX_CORES}]") from error
+    if not 1 <= cores <= _MAX_CORES:
+        raise ValueError(f"{_CORES_ENV} must be in [1, {_MAX_CORES}]")
+    return cores
 
 
 def register():
@@ -202,6 +214,7 @@ def register():
     mode = os.getenv(_MODE_ENV, "decode")
     if mode not in {"decode", "spec", "both"}:
         raise ValueError(f"{_MODE_ENV} must be decode, spec or both")
+    cores = _configured_cores()
     for package in ("vllm", "vllm-ascend"):
         installed = version(package)
         if not _SUPPORTED_VERSION.fullmatch(installed):
@@ -237,8 +250,17 @@ def register():
     setattr(
         gdn,
         _HELPER,
-        _wrap(original, gdn.l2norm_310p, op.default, mode, torch, diagnostics=diagnostics, is_capturing=is_capturing),
+        _wrap(
+            original,
+            gdn.l2norm_310p,
+            op.default,
+            mode,
+            torch,
+            cores=cores,
+            diagnostics=diagnostics,
+            is_capturing=is_capturing,
+        ),
     )
-    _LOG.info("310P grouped RGDR monkey patch installed (mode=%s, library=%s)", mode, path)
+    _LOG.info("310P grouped RGDR monkey patch installed (mode=%s, cores=%s, library=%s)", mode, cores, path)
     if diagnostics:
-        _LOG.warning("RGDR patch active pid=%s mode=%s", os.getpid(), mode)
+        _LOG.warning("RGDR patch active pid=%s mode=%s cores=%s", os.getpid(), mode, cores)

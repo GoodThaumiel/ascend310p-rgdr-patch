@@ -76,8 +76,8 @@ void cube_fp16(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
                   state.stride(0) >= value_heads * 128 * 128 && state.stride(0) % 16 == 0 &&
                   state.storage_offset() % 16 == 0, "state pages must be 32-byte aligned with contiguous inner axes");
   TORCH_CHECK(row_offsets || state.is_contiguous(), "uniform Cube RGDR requires contiguous state");
-  TORCH_CHECK(cores >= 1 && cores <= 7 && std::isfinite(scale) && scale > 0 && scale <= 1,
-              "cores must be in [1,7] and scale in (0,1]");
+  TORCH_CHECK(cores >= 1 && cores <= 8 && std::isfinite(scale) && scale > 0 && scale <= 1,
+              "cores must be in [1,8] and scale in (0,1]");
   const c10_npu::OptionalNPUGuard guard(q.device());
   const auto stream = c10_npu::getCurrentNPUStream().stream();
 #define RGDR_ARGS \
