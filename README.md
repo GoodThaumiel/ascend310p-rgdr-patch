@@ -3,7 +3,8 @@
 适用于 vLLM 0.23.0 与 vLLM Ascend 0.23.0 或 0.23.0rc1 搭配的 Ascend310P3 镜像。
 每 rank 支持 Q/K 与 V head 数为 8/16 或 16/32，K=V=128，使用 FP16 SSM cache。
 例如 Qwen 35B-A3B W8A8 的 attention TP2 或 attention DP2 + MoE EP2。
-默认使用 **8 核 grouped baseline** 替换普通 GDN decode 的 recurrent 算子。
+服务默认使用 **8 核逐 head 的 grouped kernel** 替换普通 GDN decode 的 recurrent 算子。
+单算子 profiling 默认使用 **8 核 `rank1-gather16-interleave`**。
 可选 `ASCEND310P_RGDR_PATCH_MODE=spec` 启用投机路径，或 `both` 启用两条路径。
 
 插件在每个 vLLM 进程中替换 `vllm_ascend._310p.ops.fla.gdn_310` 的一个 Python 函数。
@@ -158,7 +159,7 @@ curl -fsS -X POST http://127.0.0.1:18083/stop_profile
 
 ## 4. Grouped 流水探针
 
-流水探针提供三条独立的试验路径。服务继续使用 `baseline`。在目标镜像拉取代码并
+流水探针提供三条独立的试验路径，以 `legacy-baseline` 为对照。在目标镜像拉取代码并
 重新安装 Python 包，按第 2 节在新的目录（例如 `native-src/build-probes`）重建
 自定义算子，再将 `ASCEND310P_RGDR_PATCH_LIBRARY` 指向新库。
 
@@ -175,14 +176,14 @@ MTP7 用 W8。W1 没有跨 token 的前一轮写回等待，可作为 `defer-wri
 
 0.1.6 上机时，B32/W4/H8 的 `defer-write-wait` 图重放在候选 state 逐位比对失败。
 0.1.7 将跨 token 的事件改回成对发出和等待，保留前移的 dot 广播。重建后先重测
-这个场景的 eager 与图重放，并跑一次 baseline 自对照。以下通过后继续矩阵。
+这个场景的 eager 与图重放，并跑一次 `legacy-baseline` 自对照。以下通过后继续矩阵。
 
 ```bash
 export RGDR_DEVICE=0
 export RGDR_KEY_HEADS=8
 python3 -m ascend310p_rgdr_patch.profile --check --variant defer-write-wait \
   --window 4 --device "$RGDR_DEVICE" --key-heads "$RGDR_KEY_HEADS"
-for variant in baseline defer-write-wait; do
+for variant in legacy-baseline defer-write-wait; do
   python3 -m ascend310p_rgdr_patch.profile --check --graph --variant "$variant" \
     --window 4 --device "$RGDR_DEVICE" --key-heads "$RGDR_KEY_HEADS" || exit 1
 done
@@ -201,8 +202,8 @@ for window in 1 4 8; do
 done
 ```
 
-每组重放三次，与 grouped baseline 做 FP16 位模式比较。`no-state-store` 的输出仍与
-baseline 比较，GM state 则必须与调用前逐位一致。上述验证通过后，先抓 B32/W4
+每组重放三次，与 `legacy-baseline` 做 FP16 位模式比较。`no-state-store` 的输出
+按同一参考比较，GM state 则必须与调用前逐位一致。上述验证通过后，先抓 B32/W4
 的五组 profile，再用 W1 检查固定开销和写回等待，用 W8 检查 token 数增加后的趋势。
 原生路径从镜像加载 ACLNN 算子。若 OPP 注册失败，按第 3 节设置
 `ASCEND_CUSTOM_OPP_PATH`，并在新的进程中重跑对应组。
@@ -211,7 +212,7 @@ baseline 比较，GM state 则必须与调用前逐位一致。上述验证通�
 export RGDR_PROFILE_OUT=/tmp/rgdr-310p-pipeline
 mkdir -p "$RGDR_PROFILE_OUT"
 for window in 4 1 8; do
-  for variant in native baseline batch-pack defer-write-wait no-state-store; do
+  for variant in native legacy-baseline batch-pack defer-write-wait no-state-store; do
     msprof --output="$RGDR_PROFILE_OUT/$variant-w$window" --ai-core=on --aic-metrics=PipeUtilization \
       python3 -m ascend310p_rgdr_patch.profile --graph \
       --variant "$variant" --batch 32 --window "$window" --cores 8 \
@@ -224,7 +225,7 @@ done
 五组使用同一 RNG seed 和同一组输入、槽号与接受长度。原生收到 FP32 gate，
 由 grouped 使用的同一份 FP16 gate 转换。state 在每次重放前通过独立操作恢复，
 只统计目标 kernel，按执行顺序取最后 100 条。原生名称含 `RecurrentGatedDeltaRuleV310`，
-grouped baseline 匹配 `rgdr_v310_cube_grouped_packed_fp16`，各探针匹配
+`legacy-baseline` 匹配 `rgdr_v310_cube_grouped_packed_fp16`，各探针匹配
 `rgdr_v310_cube_probe_batch_pack`、`rgdr_v310_cube_probe_defer_write_wait` 或
 `rgdr_v310_cube_probe_no_state_store`。16 个 Q/K head 的自定义 kernel 带 `_h16` 后缀。
 
@@ -235,7 +236,7 @@ Scalar、Vector、MTE1/2/3、MAC 的绝对时间。几个流水的时间可重�
 
 ## 5. Grouped 7 核与 8 核对照
 
-0.1.9 默认使用 `blockDim=8`，profiling 脚本默认选择 `baseline`。
+0.1.9 起默认使用 `blockDim=8`。本节保留逐 head 路径的 c7/c8 对照。
 按第 1 节配置好扩展和环境后运行以下对照。
 核内计算和任务编号沿用当前实现，
 每个 block 以实际 `GetBlockNum()` 为步长分配 `(request, head-pair)`。
@@ -246,11 +247,11 @@ attention TP1 + DP2 + EP2 用 `RGDR_KEY_HEADS=16`。
 ```bash
 export RGDR_DEVICE=0
 export RGDR_KEY_HEADS=8
-python3 -m ascend310p_rgdr_patch.profile --check --variant baseline \
+python3 -m ascend310p_rgdr_patch.profile --check --variant legacy-baseline \
   --cores 8 --reference-cores 7 --batch 32 --window 4 \
   --key-heads "$RGDR_KEY_HEADS" --device "$RGDR_DEVICE"
 for window in 1 4 8; do
-  python3 -m ascend310p_rgdr_patch.profile --check --graph --variant baseline \
+  python3 -m ascend310p_rgdr_patch.profile --check --graph --variant legacy-baseline \
     --cores 8 --reference-cores 7 --batch 32 --window "$window" \
     --key-heads "$RGDR_KEY_HEADS" --device "$RGDR_DEVICE" || exit 1
 done
@@ -263,7 +264,7 @@ done
 ```bash
 for cores in 7 8; do
   msprof --output="/tmp/rgdr-310p-c$cores-w4" --ai-core=on --aic-metrics=PipeUtilization \
-    python3 -m ascend310p_rgdr_patch.profile --graph --variant baseline \
+    python3 -m ascend310p_rgdr_patch.profile --graph --variant legacy-baseline \
     --cores "$cores" --batch 32 --window 4 \
     --key-heads "$RGDR_KEY_HEADS" --device "$RGDR_DEVICE" \
     --warmup 20 --iterations 100 || exit 1
@@ -278,7 +279,7 @@ done
 
 使用 `./setup.sh` 编译并安装 0.1.10，然后按其输出加载新 build 的 `env.sh`。
 本轮用 B32 / H8 / c8、同卡、同采集配置。对照与所有探针使用同一个新构建，
-每组独立抓取。先用 `baseline` 做图重放逐位自对照，再测 W1/W2/W4/W8 的增长曲线。
+每组独立抓取。先用 `legacy-baseline` 做图重放逐位自对照，再测 W1/W2/W4/W8 的增长曲线。
 
 | 探针 | 执行变化 |
 |---|---|
@@ -288,17 +289,17 @@ done
 | `no-rank1-mul` | 将展开后的 delta 直接用于 state 加法，省去 rank-1 矩阵乘 key 的 Mul。 |
 | `no-rank1-add` | 将 rank-1 Mul 的结果直接写至 state UB，省去原 state 与该结果的 Add。 |
 
-五个探针的递推都与 baseline 不同，只通过 profiling 入口运行。每次测量前自动
+五个探针都改变了逐 head 路径的递推，只通过 profiling 入口运行。每次测量前自动
 检查一次输出和 state 有限、保留槽 0 逐位不变。探针继续写回所有候选 state。
 编译后的调度及 UB 读写依赖可能随改动变化。用 `no-rank1` 估计整段影响，
-用三个单阶段变体定位变化主要发生在哪段，分别与同 W baseline 比较。各差值
+用三个单阶段变体定位变化主要发生在哪段，分别与同 W 的 `legacy-baseline` 比较。各差值
 不可直接视为指令时长或相加。
 
 ```bash
 export RGDR_DEVICE=0
 export RGDR_KEY_HEADS=8
 export RGDR_PROFILE_OUT=/tmp/rgdr-310p-vector-c8
-python3 -m ascend310p_rgdr_patch.profile --check --graph --variant baseline \
+python3 -m ascend310p_rgdr_patch.profile --check --graph --variant legacy-baseline \
   --batch 32 --window 4 --key-heads "$RGDR_KEY_HEADS" --cores 8 --device "$RGDR_DEVICE"
 
 profile_rgdr() {
@@ -310,7 +311,7 @@ profile_rgdr() {
 }
 mkdir -p "$RGDR_PROFILE_OUT"
 for window in 1 2 4 8; do
-  for variant in baseline no-gate-scale no-rank1; do
+  for variant in legacy-baseline no-gate-scale no-rank1; do
     profile_rgdr "$variant" "$window" || exit 1
   done
 done
@@ -325,12 +326,20 @@ done
 Task Duration p50/p90、Vector、Scalar、MTE1/2/3 和 MAC。目标符号为
 `rgdr_v310_cube_grouped_packed_fp16` 或 `rgdr_v310_cube_probe_<variant>`，
 其中 variant 名的连字符换成下划线。H16 另外带 `_h16`。按时间排序取目标
-kernel 的最后 100 条。若观察到几个微秒的差异，重抓对应的 baseline 和探针
+kernel 的最后 100 条。若观察到几个微秒的差异，重抓对应的 `legacy-baseline` 和探针
 再判断重现性。
 
 ## 7. Rank-1 的 16 列广播与双 head 编排
 
-0.1.11 增加三条可与 baseline 逐位比较的路径。每个 delta 仅展开为一个 32B
+0.1.12 将 `rank1-gather16-interleave` 设为默认单算子性能基线。省略
+`--variant` 或显式传 `--variant baseline` 都会走交错版。
+`legacy-baseline` 保留逐 head 路径，用于历史对照和 `--check` 的 FP16 逐位参考。
+两种路径已包含在 0.1.11 的 `.so` 中。更新 Python 包即可使用新命名。
+
+B32/H8/c8、graph、CANN 9.1.0-beta.1 的设备实测中，交错版 W4/W8 逐位通过。
+Task Duration p50 分别为 875.2/1631.8 µs，逐 head 路径为 1156.4/2209.8 µs。
+
+每个 delta 仅展开为一个 32B
 FP16 数据块。Vector Mul 采用 `{1, 0, 1, 8, 1, 0}`，每个 repeat 计算一行
 128 列。delta 在行内复用同一个块，key 在行间复用同一行。仍先将乘积舍入到
 FP16，再做 FP16 state Add。
@@ -359,7 +368,7 @@ for window in 4 8; do
 done
 
 for window in 4 8; do
-  for variant in baseline rank1-brcb16 rank1-gather16 rank1-gather16-interleave; do
+  for variant in legacy-baseline rank1-brcb16 rank1-gather16 baseline; do
     msprof --output="$RGDR_PROFILE_OUT/$variant-w$window" --ai-core=on --aic-metrics=PipeUtilization \
       python3 -m ascend310p_rgdr_patch.profile --graph --variant "$variant" \
       --batch 32 --key-heads 8 --cores 8 --window "$window" --device "$RGDR_DEVICE" \
@@ -369,8 +378,10 @@ done
 ```
 
 每组取最后 100 次目标 kernel，回传 Task Duration p50/p90、Vector、Scalar、
-MAC 和 Block Num。变体的 kernel 名用 `rgdr_v310_cube_probe_` 前缀，
-将变体名中的连字符换成下划线。也可用 `--key-heads 16` 验证 H16。
+MAC 和 Block Num。`baseline` 匹配 `rgdr_v310_cube_probe_rank1_gather16_interleave`，
+`legacy-baseline` 匹配 `rgdr_v310_cube_grouped_packed_fp16`。其他变体用
+`rgdr_v310_cube_probe_` 前缀，并将变体名中的连字符换成下划线。
+也可用 `--key-heads 16` 验证 H16。
 
 ### UB 到 L0C 原语探针
 

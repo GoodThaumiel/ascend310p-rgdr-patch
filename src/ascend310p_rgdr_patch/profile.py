@@ -15,15 +15,18 @@ _DIAGNOSTIC_PROBES = {
     "no-rank1-mul": 7,
     "no-rank1-add": 8,
 }
+_LEGACY_BASELINE = 0
+_GATHER16_INTERLEAVE = 11
 _PROBES = {
-    "baseline": 0,
+    "baseline": _GATHER16_INTERLEAVE,
+    "legacy-baseline": _LEGACY_BASELINE,
     "batch-pack": 1,
     "defer-write-wait": 2,
     "no-state-store": 3,
     **_DIAGNOSTIC_PROBES,
     "rank1-brcb16": 9,
     "rank1-gather16": 10,
-    "rank1-gather16-interleave": 11,
+    "rank1-gather16-interleave": _GATHER16_INTERLEAVE,
 }
 
 
@@ -55,7 +58,7 @@ def main():
         "--reference-cores",
         type=int,
         choices=range(1, _MAX_CORES + 1),
-        help="grouped baseline core count for --check (defaults to --cores)",
+        help="legacy grouped reference core count for --check (defaults to --cores)",
     )
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--warmup", type=int, default=20)
@@ -159,18 +162,18 @@ def main():
 
         return replay
 
-    probe = _PROBES.get(args.variant, 0)
+    probe = _PROBES.get(args.variant, _LEGACY_BASELINE)
     mode = "graph" if args.graph else "eager"
     geometry = f"{args.variant} B{batch} W{window} H{key_heads} {mode}"
     if args.check:
         reference_cores = args.reference_cores or args.cores
-        case = f"{geometry} cores={args.cores} reference_cores={reference_cores}"
+        case = f"{geometry} cores={args.cores} reference=legacy-baseline reference_cores={reference_cores}"
         out.fill_(float("nan"))
-        launch(0, reference_cores)
+        launch(_LEGACY_BASELINE, reference_cores)
         torch.npu.synchronize()
         expected_out = out.cpu()
         if not expected_out.isfinite().all():
-            raise RuntimeError("Grouped baseline did not produce finite output")
+            raise RuntimeError("Legacy grouped reference did not produce finite output")
         expected_state = (initial if args.variant == "no-state-store" else state).cpu()
         run = prepare(probe)
         for repeat in range(1, 4):
