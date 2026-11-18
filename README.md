@@ -327,3 +327,67 @@ Task Duration p50/p90、Vector、Scalar、MTE1/2/3 和 MAC。目标符号为
 其中 variant 名的连字符换成下划线。H16 另外带 `_h16`。按时间排序取目标
 kernel 的最后 100 条。若观察到几个微秒的差异，重抓对应的 baseline 和探针
 再判断重现性。
+
+## 7. Rank-1 的 16 列广播与双 head 编排
+
+0.1.11 增加三条可与 baseline 逐位比较的路径。每个 delta 仅展开为一个 32B
+FP16 数据块。Vector Mul 采用 `{1, 0, 1, 8, 1, 0}`，每个 repeat 计算一行
+128 列。delta 在行内复用同一个块，key 在行间复用同一行。仍先将乘积舍入到
+FP16，再做 FP16 state Add。
+
+| 变体 | 改动 |
+|---|---|
+| `rank1-brcb16` | 用 Brcb 在 UB 生成 128×16 的 delta，保留逐 head 顺序。额外显式 UB 4 KiB/core。 |
+| `rank1-gather16` | 用预生成的 UB 偏移和 Gather 生成相同的 128×16，保留逐 head 顺序。额外显式 UB 12 KiB/core。 |
+| `rank1-gather16-interleave` | 同一 token 先取出并缩放 head 0 的 delta，提交 head 1 的 Mmad，再执行 head 0 的 Gather、Mul 与 Add。延后 head 1 的 CO1 DeQue。 |
+
+Gather 变体在 kernel 初始化时用 Brcb 生成偏移，计算期间的广播只访问 UB。
+交错版仍复用单份 L0A/L0C。head 0 的 L0C 已读出，随后才提交 head 1 的
+Mmad。交错收益以两个 Gather 变体的差值衡量。
+
+用 `./setup.sh` 重建主扩展，按其输出加载 `env.sh`，在目标设备用上一轮相同的
+CANN 环境进行验证。B32/H8/c8、W4/W8 先逐位比对输出和候选 state，包括保留槽。
+
+```bash
+export RGDR_DEVICE=2
+export RGDR_PROFILE_OUT=/tmp/rgdr-310p-rank1-16
+for window in 4 8; do
+  for variant in rank1-brcb16 rank1-gather16 rank1-gather16-interleave; do
+    python3 -m ascend310p_rgdr_patch.profile --check --graph --variant "$variant" \
+      --batch 32 --key-heads 8 --cores 8 --window "$window" --device "$RGDR_DEVICE" || exit 1
+  done
+done
+
+for window in 4 8; do
+  for variant in baseline rank1-brcb16 rank1-gather16 rank1-gather16-interleave; do
+    msprof --output="$RGDR_PROFILE_OUT/$variant-w$window" --ai-core=on --aic-metrics=PipeUtilization \
+      python3 -m ascend310p_rgdr_patch.profile --graph --variant "$variant" \
+      --batch 32 --key-heads 8 --cores 8 --window "$window" --device "$RGDR_DEVICE" \
+      --warmup 20 --iterations 100 || exit 1
+  done
+done
+```
+
+每组取最后 100 次目标 kernel，回传 Task Duration p50/p90、Vector、Scalar、
+MAC 和 Block Num。变体的 kernel 名用 `rgdr_v310_cube_probe_` 前缀，
+将变体名中的连字符换成下划线。也可用 `--key-heads 16` 验证 H16。
+
+### UB 到 L0C 原语探针
+
+310P3 支持矩阵列出了 `broadcast_ub_to_cc` FP16，仓内 GVirt 有该低阶原语的签名。
+先用单块 FP16 输入验证 `nBurst=1, lenBurst=1` 的 16×16 读回布局。
+这条指令的 CANN 9.1.0-beta.1 编译情况、输出方向和发射流水需要上机证实。
+原语探针按独立 CMake target 构建，使用全流水屏障隔离布局测试。
+
+```bash
+export RGDR_L0C_BUILD="$PWD/native-src/build-l0c-probe"
+cmake -S native-src -B "$RGDR_L0C_BUILD" -DCMAKE_BUILD_TYPE=Release \
+  -DSOC_VERSION=Ascend310P3 -DASCEND_CANN_PACKAGE_PATH="$ASCEND_HOME_PATH" \
+  -DRGDR_ENABLE_L0C_BROADCAST_PROBE=ON -DPython3_EXECUTABLE="$(command -v python3)"
+cmake --build "$RGDR_L0C_BUILD" --target rgdr_v310_l0c_probe_torch -j 8
+python3 -m ascend310p_rgdr_patch.l0c_probe --device "$RGDR_DEVICE" \
+  --library "$RGDR_L0C_BUILD/librgdr_v310_l0c_probe_torch.so"
+```
+
+回传首行、首列及 PASS 或完整编译错误。有可读 ISA 时一并回传该指令的流水归属，
+用于判断原语能否和另一 head 的 Mmad 在不同 L0C 区域并行。

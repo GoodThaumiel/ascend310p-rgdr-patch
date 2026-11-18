@@ -60,3 +60,9 @@ endfunction()
 ascendc_library(rgdr_v310_cube_fp16_kernel SHARED
   kernels/rgdr_cube_fp16.cpp kernels/rgdr_cube_grouped_fp16.cpp)
 add_cube_torch(rgdr_v310_cube_fp16_torch rgdr_v310_cube_fp16_kernel csrc/cube_fp16_binding.cpp)
+
+option(RGDR_ENABLE_L0C_BROADCAST_PROBE "Build the experimental UB-to-L0C intrinsic probe" OFF)
+if(RGDR_ENABLE_L0C_BROADCAST_PROBE)
+  ascendc_library(rgdr_v310_l0c_probe_kernel SHARED kernels/rgdr_l0c_broadcast_probe.cpp)
+  add_cube_torch(rgdr_v310_l0c_probe_torch rgdr_v310_l0c_probe_kernel csrc/l0c_probe_binding.cpp)
+endif()

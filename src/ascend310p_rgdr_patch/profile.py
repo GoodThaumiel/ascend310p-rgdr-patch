@@ -15,7 +15,16 @@ _DIAGNOSTIC_PROBES = {
     "no-rank1-mul": 7,
     "no-rank1-add": 8,
 }
-_PROBES = {"baseline": 0, "batch-pack": 1, "defer-write-wait": 2, "no-state-store": 3, **_DIAGNOSTIC_PROBES}
+_PROBES = {
+    "baseline": 0,
+    "batch-pack": 1,
+    "defer-write-wait": 2,
+    "no-state-store": 3,
+    **_DIAGNOSTIC_PROBES,
+    "rank1-brcb16": 9,
+    "rank1-gather16": 10,
+    "rank1-gather16-interleave": 11,
+}
 
 
 def _assert_bits(actual, expected, case):

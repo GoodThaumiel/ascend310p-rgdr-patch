@@ -29,6 +29,12 @@
 #include "aclrtlaunch_rgdr_v310_cube_probe_no_rank1_mul_h16.h"
 #include "aclrtlaunch_rgdr_v310_cube_probe_no_rank1_add.h"
 #include "aclrtlaunch_rgdr_v310_cube_probe_no_rank1_add_h16.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_rank1_brcb16.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_rank1_brcb16_h16.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_rank1_gather16.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_rank1_gather16_h16.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_rank1_gather16_interleave.h"
+#include "aclrtlaunch_rgdr_v310_cube_probe_rank1_gather16_interleave_h16.h"
 
 namespace {
 void cube_fp16(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
@@ -37,7 +43,7 @@ void cube_fp16(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
                double scale, bool deq, int64_t cores, bool grouped,
                const std::optional<at::Tensor>& row_offsets, int64_t probe) {
   TORCH_CHECK(!grouped || !deq, "grouped RGDR uses one L0C drain and scales in UB");
-  TORCH_CHECK(probe >= 0 && probe <= 8, "Unsupported RGDR probe ID (expected 0..8)");
+  TORCH_CHECK(probe >= 0 && probe <= 11, "Unsupported RGDR probe ID (expected 0..11)");
   TORCH_CHECK(probe == 0 || (grouped && row_offsets),
               "RGDR probes require packed grouped inputs");
   TORCH_CHECK(q.device().type() == c10::DeviceType::PrivateUse1, "NPU tensors required");
@@ -117,6 +123,9 @@ void cube_fp16(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
       RGDR_PROBE_CASE(6, no_rank1_broadcast);
       RGDR_PROBE_CASE(7, no_rank1_mul);
       RGDR_PROBE_CASE(8, no_rank1_add);
+      RGDR_PROBE_CASE(9, rank1_brcb16);
+      RGDR_PROBE_CASE(10, rank1_gather16);
+      RGDR_PROBE_CASE(11, rank1_gather16_interleave);
 #undef RGDR_PROBE_CASE
       default:
         TORCH_CHECK(false, "Unsupported RGDR probe ID");

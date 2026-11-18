@@ -31,6 +31,9 @@ enum Probe : uint32_t {
     NO_RANK1_BROADCAST = 6,
     NO_RANK1_MUL = 7,
     NO_RANK1_ADD = 8,
+    RANK1_BRCB16 = 9,
+    RANK1_GATHER16 = 10,
+    RANK1_GATHER16_INTERLEAVE = 11,
 };
 
 template <HardEvent Event>
@@ -44,6 +47,9 @@ __aicore__ inline void Sync()
 template <bool PACKED = false, uint32_t HK = 8, Probe PROBE = BASELINE>
 class GroupedFp16RGDR {
     static constexpr uint32_t HV = HK * PAIR;
+    static constexpr bool GATHER_DELTA =
+        PROBE == RANK1_GATHER16 || PROBE == RANK1_GATHER16_INTERLEAVE;
+    static constexpr bool COMPACT_DELTA = PROBE == RANK1_BRCB16 || GATHER_DELTA;
 public:
     __aicore__ inline void Init(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR gate,
                                 GM_ADDR state, GM_ADDR indices, GM_ADDR accepted, GM_ADDR out,
@@ -85,6 +91,22 @@ public:
         pipe_.InitBuffer(scratch_, (PROBE == BATCH_PACK ? PACK_BLOCKS : 1) * FRACTAL * sizeof(half));
         pipe_.InitBuffer(vectors_, (5 * V + PAIR_VALUE) * sizeof(half));
         pipe_.InitBuffer(gatherOffsets_, 3 * V * sizeof(uint32_t));
+        if constexpr (COMPACT_DELTA) {
+            // Leave headroom for the M200 Brcb internal 8 KiB workspace.
+            pipe_.InitBuffer(deltaBlocks_, V * C0 * sizeof(half));
+        }
+        if constexpr (GATHER_DELTA) {
+            pipe_.InitBuffer(deltaGatherOffsets_, V * C0 * sizeof(uint32_t));
+            auto offsets = deltaBlocks_.Get<uint32_t>();
+            for (uint32_t row = 0; row < V; ++row) {
+                // One uint32 value expands into 8 lanes; use two per row.
+                offsets.SetValue(2 * row, row * sizeof(half));
+                offsets.SetValue(2 * row + 1, row * sizeof(half));
+            }
+            Sync<HardEvent::S_V>();
+            Brcb(deltaGatherOffsets_.Get<uint32_t>(), offsets, 2 * V / 8, {1, 8});
+            PipeBarrier<PIPE_V>();
+        }
 
         auto rhs = rhs_.Get<half>();
         Duplicate(rhs[(K_BLOCKS - 1) * FRACTAL], static_cast<half>(0), FRACTAL);
@@ -236,17 +258,25 @@ private:
             if constexpr (PROBE != DEFER_WRITE_WAIT) {
                 BroadcastLane(vectors[V], dots, t);
             }
-            for (uint32_t h = 0; h < PAIR; ++h) {
-                const uint32_t lane = head + h;
-                auto state = states[h * STATE];
-                BroadcastLane(vectors[2 * V], gates[t * HV], lane);
-                BroadcastLane(vectors[3 * V], negativeBeta[t * HV], lane);
-                if constexpr (PROBE != NO_GATE_SCALE) {
-                    Mul(state, state, vectors[2 * V], K, V, {1, 1, 1, K / C0, K / C0, 0});
+            auto tokenValues = values[t * PAIR_VALUE];
+            if constexpr (PROBE == RANK1_GATHER16_INTERLEAVE) {
+                QueueHeadMatvec(states, b2, tokenValues, gates[t * HV], negativeBeta[t * HV], head);
+                ReadMatvec(c1_.DeQue<half>(), output);
+                // Delta 0 is now scaled. Head 1 only reuses the gate and beta
+                // scratch, so it can launch before delta 0's rank-1 update.
+                QueueHeadMatvec(states[STATE], b2, tokenValues[V], gates[t * HV],
+                                negativeBeta[t * HV], head + 1);
+                Update(states, key, output);
+                ReadMatvec(c1_.DeQue<half>(), output[V]);
+                Update(states[STATE], key, output[V]);
+            } else {
+                for (uint32_t h = 0; h < PAIR; ++h) {
+                    auto state = states[h * STATE];
+                    QueueHeadMatvec(state, b2, tokenValues[h * V], gates[t * HV],
+                                    negativeBeta[t * HV], head + h);
+                    ReadMatvec(c1_.DeQue<half>(), output[h * V]);
+                    Update(state, key, output[h * V]);
                 }
-                PackValue(values[t * PAIR_VALUE + h * V]);
-                auto c = Matvec(state, b2);
-                Update(state, key, c, output[h * V]);
             }
             b2_.FreeTensor(b2);
             Sync<HardEvent::V_MTE3>();
@@ -340,8 +370,18 @@ private:
         return b2_.DeQue<half>();
     }
 
-    __aicore__ inline LocalTensor<half> Matvec(LocalTensor<half> state, LocalTensor<half> b2)
+    __aicore__ inline void QueueHeadMatvec(LocalTensor<half> state, LocalTensor<half> b2,
+                                         LocalTensor<half> value, LocalTensor<half> gate,
+                                         LocalTensor<half> negativeBeta, uint32_t lane)
     {
+        auto vectors = vectors_.Get<half>();
+        BroadcastLane(vectors[2 * V], gate, lane);
+        BroadcastLane(vectors[3 * V], negativeBeta, lane);
+        if constexpr (PROBE != NO_GATE_SCALE) {
+            Mul(state, state, vectors[2 * V], K, V, {1, 1, 1, K / C0, K / C0, 0});
+        }
+        PackValue(value);
+
         auto a1 = a1_.Get<half>();
         Sync<HardEvent::V_MTE3>();
         for (uint32_t block = 0; block < K / C0; ++block) {
@@ -368,11 +408,9 @@ private:
         Mmad(c, a2, b2, params);
         c1_.EnQue(c);
         a2_.FreeTensor(a2);
-        return c1_.DeQue<half>();
     }
 
-    __aicore__ inline void Update(LocalTensor<half> state, LocalTensor<half> key,
-                                  LocalTensor<half> c, LocalTensor<half> output)
+    __aicore__ inline void ReadMatvec(LocalTensor<half> c, LocalTensor<half> output)
     {
         auto tile = c2_.AllocTensor<half>();
         DataCopyEnhancedParams drain{};
@@ -384,7 +422,6 @@ private:
 
         auto vectors = vectors_.Get<half>();
         auto delta = vectors[4 * V];
-        auto scratch = vectors[2 * V];
         auto index = gatherOffsets_.Get<uint32_t>();
         Gather(delta, tile, index, 0, V);
         Gather(output, tile, index[V], 0, V);
@@ -394,15 +431,30 @@ private:
 
         Mul(delta, delta, vectors[3 * V], V);
         PipeBarrier<PIPE_V>();
+    }
+
+    __aicore__ inline void Update(LocalTensor<half> state, LocalTensor<half> key, LocalTensor<half> output)
+    {
+        auto vectors = vectors_.Get<half>();
+        auto delta = vectors[4 * V];
+        auto scratch = vectors[2 * V];
         auto update = update_.Get<half>();
-        if constexpr (PROBE != NO_RANK1 && PROBE != NO_RANK1_BROADCAST) {
+        if constexpr (GATHER_DELTA) {
+            Gather(deltaBlocks_.Get<half>(), delta, deltaGatherOffsets_.Get<uint32_t>(), 0, V * C0);
+        } else if constexpr (PROBE == RANK1_BRCB16) {
+            Brcb(deltaBlocks_.Get<half>(), delta, V / 8, {1, 8});
+        } else if constexpr (PROBE != NO_RANK1 && PROBE != NO_RANK1_BROADCAST) {
             uint32_t shape[2] = {V, K};
             uint32_t deltaShape[2] = {V, 1};
             Broadcast<half, 2, 1>(update, delta, shape, deltaShape);
         }
         Mul(scratch, delta, vectors[V], V);
         PipeBarrier<PIPE_V>();
-        if constexpr (PROBE == NO_RANK1_BROADCAST) {
+        if constexpr (COMPACT_DELTA) {
+            // One 128-element repeat per row. The first source repeats one
+            // 16-element block across all 8 blocks, and key reuses a full row.
+            Mul(update, deltaBlocks_.Get<half>(), key, K, V, {1, 0, 1, K / C0, 1, 0});
+        } else if constexpr (PROBE == NO_RANK1_BROADCAST) {
             // Use a defined 128x128 source for the same strided multiply.
             Mul(update, state, key, K, V, {1, 1, 1, K / C0, K / C0, 0});
         } else if constexpr (PROBE == NO_RANK1_ADD) {
@@ -428,6 +480,7 @@ private:
     TQue<TPosition::CO1, 1> c1_;
     TQue<TPosition::CO2, 1> c2_;
     TBuf<TPosition::VECCALC> states_, update_, qkv_, gates_, rhs_, valueTail_, scratch_, vectors_, gatherOffsets_;
+    TBuf<TPosition::VECCALC> deltaBlocks_, deltaGatherOffsets_;
     GlobalTensor<half> q_, k_, v_, beta_, gate_, state_, out_;
     GlobalTensor<int32_t> indices_, accepted_, rowOffsets_;
     uint32_t batch_, window_, slots_, tokens_;
@@ -580,6 +633,54 @@ extern "C" __global__ __aicore__ void rgdr_v310_cube_probe_no_rank1_add_h16(
     uint32_t slots, float scale, GM_ADDR rowOffsets, uint32_t tokens, uint64_t stateStride)
 {
     RUN_GROUPED_PROBE(16, NO_RANK1_ADD);
+}
+
+extern "C" __global__ __aicore__ void rgdr_v310_cube_probe_rank1_brcb16(
+    GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR gate, GM_ADDR state,
+    GM_ADDR indices, GM_ADDR accepted, GM_ADDR out, uint32_t batch, uint32_t window,
+    uint32_t slots, float scale, GM_ADDR rowOffsets, uint32_t tokens, uint64_t stateStride)
+{
+    RUN_GROUPED_PROBE(8, RANK1_BRCB16);
+}
+
+extern "C" __global__ __aicore__ void rgdr_v310_cube_probe_rank1_brcb16_h16(
+    GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR gate, GM_ADDR state,
+    GM_ADDR indices, GM_ADDR accepted, GM_ADDR out, uint32_t batch, uint32_t window,
+    uint32_t slots, float scale, GM_ADDR rowOffsets, uint32_t tokens, uint64_t stateStride)
+{
+    RUN_GROUPED_PROBE(16, RANK1_BRCB16);
+}
+
+extern "C" __global__ __aicore__ void rgdr_v310_cube_probe_rank1_gather16(
+    GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR gate, GM_ADDR state,
+    GM_ADDR indices, GM_ADDR accepted, GM_ADDR out, uint32_t batch, uint32_t window,
+    uint32_t slots, float scale, GM_ADDR rowOffsets, uint32_t tokens, uint64_t stateStride)
+{
+    RUN_GROUPED_PROBE(8, RANK1_GATHER16);
+}
+
+extern "C" __global__ __aicore__ void rgdr_v310_cube_probe_rank1_gather16_h16(
+    GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR gate, GM_ADDR state,
+    GM_ADDR indices, GM_ADDR accepted, GM_ADDR out, uint32_t batch, uint32_t window,
+    uint32_t slots, float scale, GM_ADDR rowOffsets, uint32_t tokens, uint64_t stateStride)
+{
+    RUN_GROUPED_PROBE(16, RANK1_GATHER16);
+}
+
+extern "C" __global__ __aicore__ void rgdr_v310_cube_probe_rank1_gather16_interleave(
+    GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR gate, GM_ADDR state,
+    GM_ADDR indices, GM_ADDR accepted, GM_ADDR out, uint32_t batch, uint32_t window,
+    uint32_t slots, float scale, GM_ADDR rowOffsets, uint32_t tokens, uint64_t stateStride)
+{
+    RUN_GROUPED_PROBE(8, RANK1_GATHER16_INTERLEAVE);
+}
+
+extern "C" __global__ __aicore__ void rgdr_v310_cube_probe_rank1_gather16_interleave_h16(
+    GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR gate, GM_ADDR state,
+    GM_ADDR indices, GM_ADDR accepted, GM_ADDR out, uint32_t batch, uint32_t window,
+    uint32_t slots, float scale, GM_ADDR rowOffsets, uint32_t tokens, uint64_t stateStride)
+{
+    RUN_GROUPED_PROBE(16, RANK1_GATHER16_INTERLEAVE);
 }
 
 #undef RUN_GROUPED_PROBE
