@@ -17,6 +17,7 @@ _DIAGNOSTIC_PROBES = {
 }
 _LEGACY_BASELINE = 0
 _GATHER16_INTERLEAVE = 11
+_FUSED_PROBES = {"rank1-gather16-fused": 12, "rank1-gather16-interleave-fused": 13}
 _PROBES = {
     "baseline": _GATHER16_INTERLEAVE,
     "legacy-baseline": _LEGACY_BASELINE,
@@ -27,6 +28,7 @@ _PROBES = {
     "rank1-brcb16": 9,
     "rank1-gather16": 10,
     "rank1-gather16-interleave": _GATHER16_INTERLEAVE,
+    **_FUSED_PROBES,
 }
 
 
@@ -46,6 +48,22 @@ def _assert_bits(actual, expected, case):
     )
 
 
+def _check_fused(actual, expected, case):
+    actual = actual.cpu().flatten()
+    expected = expected.flatten()
+    max_abs = 0.0
+    squared_error = 0.0
+    changed = 0
+    for got, ref in zip(actual.split(1 << 20), expected.split(1 << 20), strict=True):
+        changed += torch.count_nonzero(got.view(torch.int16) != ref.view(torch.int16)).item()
+        diff = got.float() - ref.float()
+        max_abs = max(max_abs, diff.abs().max().item())
+        squared_error += diff.square().sum(dtype=torch.float64).item()
+    rmse = (squared_error / actual.numel()) ** 0.5
+    print(f"{case} changed={changed}/{actual.numel()} max_abs={max_abs:.6g} rmse={rmse:.6g}", flush=True)
+    torch.testing.assert_close(actual, expected, atol=2**-11, rtol=2**-8, msg=lambda msg: f"{case}: {msg}")
+
+
 @torch.inference_mode()
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -58,13 +76,19 @@ def main():
         "--reference-cores",
         type=int,
         choices=range(1, _MAX_CORES + 1),
-        help="legacy grouped reference core count for --check (defaults to --cores)",
+        help="reference core count for --check (defaults to --cores)",
+    )
+    parser.add_argument(
+        "--reference-variant",
+        choices=("legacy-baseline", "baseline", "rank1-gather16", "rank1-gather16-fused"),
+        help="reference kernel for --check (defaults to legacy-baseline)",
     )
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--graph", action="store_true", help="run each launch through ACLGraph replay")
     parser.add_argument("--check", action="store_true", help="compare output and state instead of profiling")
+    parser.add_argument("--fused-tolerance", action="store_true", help="report FP16 differences using atol/rtol")
     args = parser.parse_args()
     if not 1 <= args.batch <= 1024 or args.warmup < 0 or args.iterations < 1:
         parser.error("batch must be in 1..1024, warmup non-negative and iterations positive")
@@ -73,8 +97,10 @@ def main():
     diagnostic = args.variant in _DIAGNOSTIC_PROBES
     if args.check and diagnostic:
         parser.error("this diagnostic changes the recurrence and cannot use --check")
-    if args.reference_cores is not None and not args.check:
-        parser.error("--reference-cores requires --check")
+    if (args.reference_cores is not None or args.reference_variant is not None) and not args.check:
+        parser.error("reference arguments require --check")
+    if args.fused_tolerance and (not args.check or args.variant not in _FUSED_PROBES):
+        parser.error("--fused-tolerance requires --check with a fused rank-1 variant")
     native = args.variant == "native"
     if native:
         from vllm_ascend.utils import bootstrap_custom_op_env
@@ -167,13 +193,14 @@ def main():
     geometry = f"{args.variant} B{batch} W{window} H{key_heads} {mode}"
     if args.check:
         reference_cores = args.reference_cores or args.cores
-        case = f"{geometry} cores={args.cores} reference=legacy-baseline reference_cores={reference_cores}"
+        reference = args.reference_variant or "legacy-baseline"
+        case = f"{geometry} cores={args.cores} reference={reference} reference_cores={reference_cores}"
         out.fill_(float("nan"))
-        launch(_LEGACY_BASELINE, reference_cores)
+        launch(_PROBES[reference], reference_cores)
         torch.npu.synchronize()
         expected_out = out.cpu()
         if not expected_out.isfinite().all():
-            raise RuntimeError("Legacy grouped reference did not produce finite output")
+            raise RuntimeError(f"{reference} did not produce finite output")
         expected_state = (initial if args.variant == "no-state-store" else state).cpu()
         run = prepare(probe)
         for repeat in range(1, 4):
@@ -181,8 +208,13 @@ def main():
             out.fill_(float("nan"))
             run()
             torch.npu.synchronize()
-            _assert_bits(out, expected_out, f"{case} repeat={repeat} output")
-            _assert_bits(state, expected_state, f"{case} repeat={repeat} state")
+            if args.fused_tolerance:
+                _assert_bits(state[0], initial[0].cpu(), f"{case} repeat={repeat} reserved slot")
+                _check_fused(out, expected_out, f"{case} repeat={repeat} output")
+                _check_fused(state, expected_state, f"{case} repeat={repeat} state")
+            else:
+                _assert_bits(out, expected_out, f"{case} repeat={repeat} output")
+                _assert_bits(state, expected_state, f"{case} repeat={repeat} state")
         print(f"PASS {case} repeats=3")
         return
 

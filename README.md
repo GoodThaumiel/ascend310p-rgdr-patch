@@ -402,3 +402,94 @@ python3 -m ascend310p_rgdr_patch.l0c_probe --device "$RGDR_DEVICE" \
 
 回传首行、首列及 PASS 或完整编译错误。有可读 ISA 时一并回传该指令的流水归属，
 用于判断原语能否和另一 head 的 Mmad 在不同 L0C 区域并行。
+
+## 8. Rank-1 融合与 L0C 并行消融
+
+0.1.13 的单算子基线是 `rank1-gather16-interleave`。`./setup.sh` 构建主扩展，
+按输出加载新构建的环境。保持上一轮的设备、CANN 9.1.0-beta.1 和图模式参数。
+
+| 变体 | Rank-1 更新 | Head 调度 |
+|---|---|---|
+| `rank1-gather16` | 分步 FP16 Mul 与 Add | 串行 |
+| `rank1-gather16-fused` | FP16 `MulAddDst` 原位累加 | 串行 |
+| `baseline` | 分步 FP16 Mul 与 Add | 交错 |
+| `rank1-gather16-interleave-fused` | FP16 `MulAddDst` 原位累加 | 交错 |
+
+四组共享相同的 16 列 Gather 和写回。融合版去掉乘积的 UB 写读，保留相同的 UB
+区间分配，以便先隔离指令变化。候选 state 的舍入可能随融合而变。主扩展仍以已验证
+的分步算术作为服务路径。
+
+### 融合版正确性与 profiling
+
+先在 W4/W8 分别跑。相比各自的分步版，融合测试记录 output 和 state 的位差数量、
+max absolute error 和 RMSE。混合门槛为 `atol=2^-11, rtol=2^-8`，仅用于筛选这一
+合成输入实验。保留槽始终逐位比较。两个融合调度之间要求逐位一致。
+
+```bash
+export RGDR_DEVICE=2
+export RGDR_RESULTS=/tmp/rgdr-310p-rank1-fusion
+mkdir -p "$RGDR_RESULTS"
+for window in 4 8; do
+  common=(--batch 32 --key-heads 8 --cores 8 --window "$window" --device "$RGDR_DEVICE" --graph)
+  python3 -m ascend310p_rgdr_patch.profile "${common[@]}" --check --variant baseline || exit 1
+  python3 -m ascend310p_rgdr_patch.profile "${common[@]}" --check --fused-tolerance \
+    --variant rank1-gather16-fused --reference-variant rank1-gather16 || exit 1
+  python3 -m ascend310p_rgdr_patch.profile "${common[@]}" --check --fused-tolerance \
+    --variant rank1-gather16-interleave-fused --reference-variant baseline || exit 1
+  python3 -m ascend310p_rgdr_patch.profile "${common[@]}" --check \
+    --variant rank1-gather16-interleave-fused --reference-variant rank1-gather16-fused || exit 1
+  for variant in rank1-gather16 rank1-gather16-fused baseline rank1-gather16-interleave-fused; do
+    msprof --output="$RGDR_RESULTS/$variant-w$window" --ai-core=on --aic-metrics=PipeUtilization \
+      python3 -m ascend310p_rgdr_patch.profile "${common[@]}" --variant "$variant" \
+      --warmup 20 --iterations 100 || exit 1
+  done
+done
+```
+
+截取目标 kernel 最后 100 次。回传 paired p50/p90、Vector、Scalar 和 Block Num。
+`baseline` 的符号仍为 `rgdr_v310_cube_probe_rank1_gather16_interleave`，
+融合符号分别为 `rgdr_v310_cube_probe_rank1_gather16_fused` 与
+`rgdr_v310_cube_probe_rank1_gather16_interleave_fused`。优先比较同一调度下融合与
+分步的差值；两个融合版的差值用于判断交错收益还能保留多少。
+
+### L0C 原语成本与串行／交错
+
+按第 7 节重新构建带 `RGDR_ENABLE_L0C_BROADCAST_PROBE=ON` 的独立库。保留原单 tile
+`layout` 探针。新探针按单核模拟一组 128 行 delta 和另一组 128×144×16 FP16 Mmad，
+分别占用 4 KiB L0C 区间。A/B 在重复循环前搬到 L0A/L0B。
+
+| 变体 | 循环内容 |
+|---|---|
+| `gather` | UB Gather 生成 128×16 的 Vector 可读结果。 |
+| `broadcast-raw` | UB→L0C 广播，循环结束后只读回并转置一次。 |
+| `broadcast` | 每次广播后都读回 L0C→UB，并逐 tile 转置为与 Gather 相同的布局。 |
+| `mmad` | 独立 Mmad 并读回，作为计算对照。 |
+| `serial` | 提交 Mmad，等待全流水屏障，再发广播并读回两块结果。 |
+| `interleaved` | 连续提交 Mmad 和广播，再等全流水屏障并读回两块结果。 |
+
+先用 `--repeats 1` 验证广播的八个 tile、Mmad 结果和未用输出。再用循环 32 与
+128 次抓数据，按两点差值收紧对重复成本的估计。两个组合变体共享读回与转置，
+差值包含去掉中间屏障以及潜在的硬件重叠。如果需要归因到具体指令，另看
+流水 trace；`broadcast-raw` 的斜率也包含每轮安全屏障。
+
+```bash
+export RGDR_L0C_LIBRARY="$RGDR_L0C_BUILD/librgdr_v310_l0c_probe_torch.so"
+export RGDR_L0C_RESULTS=/tmp/rgdr-310p-l0c-overlap
+mkdir -p "$RGDR_L0C_RESULTS"
+variants=(gather broadcast-raw broadcast mmad serial interleaved)
+for variant in "${variants[@]}"; do
+  python3 -m ascend310p_rgdr_patch.l0c_probe --library "$RGDR_L0C_LIBRARY" --device "$RGDR_DEVICE" \
+    --variant "$variant" --repeats 1 --check --graph || exit 1
+done
+for repeats in 32 128; do
+  for variant in "${variants[@]}"; do
+    msprof --output="$RGDR_L0C_RESULTS/$variant-r$repeats" --ai-core=on --aic-metrics=PipeUtilization \
+      python3 -m ascend310p_rgdr_patch.l0c_probe --library "$RGDR_L0C_LIBRARY" --device "$RGDR_DEVICE" \
+      --variant "$variant" --repeats "$repeats" --graph || exit 1
+  done
+done
+```
+
+回传 `rgdr_v310_l0c_<variant>` 的 Task Duration p50/p90、Vector、Scalar、MAC、
+MTE 和 Block Num。符号中的连字符换成下划线。完整 L0C rank-1 仍需确定原 state
+进入累加器的路径，本节先测可独立验证的布局和流水成本。

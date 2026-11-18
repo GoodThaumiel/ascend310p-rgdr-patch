@@ -34,6 +34,8 @@ enum Probe : uint32_t {
     RANK1_BRCB16 = 9,
     RANK1_GATHER16 = 10,
     RANK1_GATHER16_INTERLEAVE = 11,
+    RANK1_GATHER16_FUSED = 12,
+    RANK1_GATHER16_INTERLEAVE_FUSED = 13,
 };
 
 template <HardEvent Event>
@@ -47,8 +49,12 @@ __aicore__ inline void Sync()
 template <bool PACKED = false, uint32_t HK = 8, Probe PROBE = BASELINE>
 class GroupedFp16RGDR {
     static constexpr uint32_t HV = HK * PAIR;
+    static constexpr bool FUSED_UPDATE =
+        PROBE == RANK1_GATHER16_FUSED || PROBE == RANK1_GATHER16_INTERLEAVE_FUSED;
+    static constexpr bool INTERLEAVE_HEADS =
+        PROBE == RANK1_GATHER16_INTERLEAVE || PROBE == RANK1_GATHER16_INTERLEAVE_FUSED;
     static constexpr bool GATHER_DELTA =
-        PROBE == RANK1_GATHER16 || PROBE == RANK1_GATHER16_INTERLEAVE;
+        PROBE == RANK1_GATHER16 || INTERLEAVE_HEADS || FUSED_UPDATE;
     static constexpr bool COMPACT_DELTA = PROBE == RANK1_BRCB16 || GATHER_DELTA;
 public:
     __aicore__ inline void Init(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR gate,
@@ -259,7 +265,7 @@ private:
                 BroadcastLane(vectors[V], dots, t);
             }
             auto tokenValues = values[t * PAIR_VALUE];
-            if constexpr (PROBE == RANK1_GATHER16_INTERLEAVE) {
+            if constexpr (INTERLEAVE_HEADS) {
                 QueueHeadMatvec(states, b2, tokenValues, gates[t * HV], negativeBeta[t * HV], head);
                 ReadMatvec(c1_.DeQue<half>(), output);
                 // Delta 0 is now scaled. Head 1 only reuses the gate and beta
@@ -450,7 +456,11 @@ private:
         }
         Mul(scratch, delta, vectors[V], V);
         PipeBarrier<PIPE_V>();
-        if constexpr (COMPACT_DELTA) {
+        if constexpr (FUSED_UPDATE) {
+            // Same compact layout as the split Mul, but accumulate directly
+            // into FP16 state without materializing the product in UB.
+            MulAddDst(state, deltaBlocks_.Get<half>(), key, K, V, {1, 0, 1, K / C0, 1, 0});
+        } else if constexpr (COMPACT_DELTA) {
             // One 128-element repeat per row. The first source repeats one
             // 16-element block across all 8 blocks, and key reuses a full row.
             Mul(update, deltaBlocks_.Get<half>(), key, K, V, {1, 0, 1, K / C0, 1, 0});
@@ -465,7 +475,7 @@ private:
         }
         Add(output, output, scratch, V);
         PipeBarrier<PIPE_V>();
-        if constexpr (PROBE != NO_RANK1 && PROBE != NO_RANK1_ADD) {
+        if constexpr (!FUSED_UPDATE && PROBE != NO_RANK1 && PROBE != NO_RANK1_ADD) {
             Add(state, state, update, STATE);
         }
         Muls(output, output, scale_, V);
@@ -681,6 +691,38 @@ extern "C" __global__ __aicore__ void rgdr_v310_cube_probe_rank1_gather16_interl
     uint32_t slots, float scale, GM_ADDR rowOffsets, uint32_t tokens, uint64_t stateStride)
 {
     RUN_GROUPED_PROBE(16, RANK1_GATHER16_INTERLEAVE);
+}
+
+extern "C" __global__ __aicore__ void rgdr_v310_cube_probe_rank1_gather16_fused(
+    GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR gate, GM_ADDR state,
+    GM_ADDR indices, GM_ADDR accepted, GM_ADDR out, uint32_t batch, uint32_t window,
+    uint32_t slots, float scale, GM_ADDR rowOffsets, uint32_t tokens, uint64_t stateStride)
+{
+    RUN_GROUPED_PROBE(8, RANK1_GATHER16_FUSED);
+}
+
+extern "C" __global__ __aicore__ void rgdr_v310_cube_probe_rank1_gather16_fused_h16(
+    GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR gate, GM_ADDR state,
+    GM_ADDR indices, GM_ADDR accepted, GM_ADDR out, uint32_t batch, uint32_t window,
+    uint32_t slots, float scale, GM_ADDR rowOffsets, uint32_t tokens, uint64_t stateStride)
+{
+    RUN_GROUPED_PROBE(16, RANK1_GATHER16_FUSED);
+}
+
+extern "C" __global__ __aicore__ void rgdr_v310_cube_probe_rank1_gather16_interleave_fused(
+    GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR gate, GM_ADDR state,
+    GM_ADDR indices, GM_ADDR accepted, GM_ADDR out, uint32_t batch, uint32_t window,
+    uint32_t slots, float scale, GM_ADDR rowOffsets, uint32_t tokens, uint64_t stateStride)
+{
+    RUN_GROUPED_PROBE(8, RANK1_GATHER16_INTERLEAVE_FUSED);
+}
+
+extern "C" __global__ __aicore__ void rgdr_v310_cube_probe_rank1_gather16_interleave_fused_h16(
+    GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR gate, GM_ADDR state,
+    GM_ADDR indices, GM_ADDR accepted, GM_ADDR out, uint32_t batch, uint32_t window,
+    uint32_t slots, float scale, GM_ADDR rowOffsets, uint32_t tokens, uint64_t stateStride)
+{
+    RUN_GROUPED_PROBE(16, RANK1_GATHER16_INTERLEAVE_FUSED);
 }
 
 #undef RUN_GROUPED_PROBE
