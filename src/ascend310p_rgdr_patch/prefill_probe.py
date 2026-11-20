@@ -18,6 +18,7 @@ from itertools import accumulate
 from pathlib import Path
 
 SUITES = ("env", "topk", "rmsnorm", "gmm", "gdn", "metadata")
+WY_LIBRARY_ENV = "VLLM_ASCEND_310P_COMPUTE_WY_LIBRARY"
 SEED = 31024030
 CHUNK = 64
 CANN_RE = re.compile(r"\d+\.\d+\.\d+(?:[. _-]?(?:beta|rc)\d+)?", re.I)
@@ -840,6 +841,16 @@ def compare_reports(cases, reference):
     return comparisons
 
 
+def missing_gdn_bindings(cases, focused):
+    keys = (
+        {row["comparison_key"] for row in cases if row["name"].startswith("gdn/")}
+        if focused
+        else {"gdn/h", "gdn/o", "gdn/wy"}
+    )
+    passed = {row.get("comparison_key") for row in cases if row["status"] == "PASSED"}
+    return sorted(keys - passed)
+
+
 def int_list(value):
     try:
         values = tuple(int(item) for item in value.split(","))
@@ -962,16 +973,27 @@ def main(argv=None):
                 report["environment"]["vllm_ascend_custom_ops"] = bool(
                     enable_custom_op()
                 )
-                libraries = list(args.extra_library)
-                wy_library = os.getenv("VLLM_ASCEND_310P_COMPUTE_WY_LIBRARY")
-                if wy_library:
-                    libraries.append(Path(wy_library))
-                for library in dict.fromkeys(
-                    path.resolve(strict=True) for path in libraries
-                ):
-                    torch.ops.load_library(str(library))
             except Exception:
                 report["suite_errors"]["gdn_library_init"] = traceback.format_exc()
+            libraries = {path: "--extra-library" for path in args.extra_library}
+            wy_library = os.getenv(WY_LIBRARY_ENV)
+            if wy_library and (
+                not args.case or re.search(args.case, "gdn/wy/standalone")
+            ):
+                libraries[Path(wy_library)] = WY_LIBRARY_ENV
+            for path, setting in libraries.items():
+                library = path.expanduser().resolve()
+                error_key = f"gdn_library_init:{library}"
+                if not library.is_file():
+                    report["suite_errors"][error_key] = (
+                        f"{setting} points to a missing file: {library}. "
+                        "Use the library built and smoke-tested in this container."
+                    )
+                    continue
+                try:
+                    torch.ops.load_library(str(library))
+                except Exception:
+                    report["suite_errors"][error_key] = traceback.format_exc()
 
         with torch.inference_mode():
             for suite in dict.fromkeys(suites):
@@ -988,15 +1010,9 @@ def main(argv=None):
             and any(suite != "env" for suite in suites)
         ):
             raise RuntimeError("--case filtered out every case")
-        if not args.case and "gdn" in suites:
-            for key in ("gdn/h", "gdn/o", "gdn/wy"):
-                if not any(
-                    row.get("comparison_key") == key and row["status"] == "PASSED"
-                    for row in report["cases"]
-                ):
-                    report["suite_errors"][key] = (
-                        "no working binding for this comparison"
-                    )
+        if "gdn" in suites:
+            for key in missing_gdn_bindings(report["cases"], focused=bool(args.case)):
+                report["suite_errors"][key] = "no working binding for this comparison"
         report["environment"]["loaded_libraries_after"] = loaded_libraries()
         if args.reference_json:
             ref = json.loads(args.reference_json.read_text())

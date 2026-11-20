@@ -511,11 +511,17 @@ python3 -m ascend310p_rgdr_patch.prefill_probe --device 0 \
   --label v24 --expect-cann 9.1.0-beta1 --expect-vllm-ascend 0.24.0 \
   --output "$RESULTS/v24.json" 2>&1 | tee "$RESULTS/v24.log"
 
-# 只在 v30 容器运行，将库路径改为已通过 smoke 的实际路径
-export VLLM_ASCEND_310P_COMPUTE_WY_LIBRARY=/absolute/path/to/libreplayssm_310p_compute_wy.so
-python3 -m ascend310p_rgdr_patch.prefill_probe --device 0 \
-  --label v30 --expect-cann 9.2.1 --expect-vllm-ascend 0.30.0 \
-  --output "$RESULTS/v30.json" 2>&1 | tee "$RESULTS/v30.log"
+# 只在 v30 容器运行，沿用 WY smoke 使用的库路径或构建目录
+if [[ ! -f ${VLLM_ASCEND_310P_COMPUTE_WY_LIBRARY:-} && -n ${WY_BUILD:-} ]]; then
+  export VLLM_ASCEND_310P_COMPUTE_WY_LIBRARY="$WY_BUILD/libreplayssm_310p_compute_wy.so"
+fi
+if [[ -f ${VLLM_ASCEND_310P_COMPUTE_WY_LIBRARY:-} ]]; then
+  python3 -m ascend310p_rgdr_patch.prefill_probe --device 0 \
+    --label v30 --expect-cann 9.2.1 --expect-vllm-ascend 0.30.0 \
+    --output "$RESULTS/v30.json" 2>&1 | tee "$RESULTS/v30.log"
+else
+  printf '%s\n' '请先设置 WY smoke 使用的 VLLM_ASCEND_310P_COMPUTE_WY_LIBRARY。' >&2
+fi
 ```
 
 只查环境时加 `--suite env`。探针报告 CANN Toolkit/OPP 路径、安装版本文件、进程实际映射的
@@ -544,6 +550,8 @@ python3 -m ascend310p_rgdr_patch.prefill_probe --device 0 \
 至少一个可运行的 binding。结果中的 `PASSED` 表示调用成功且输出有限，`check` 字段提供误差和
 TopK 选中分数差异，作为比较数据。只测一个阶段可执行
 `--suite gdn --case '^gdn/h/'`，只测原生 TopK 可执行 `--suite topk --case '^topk/1024x256/native$'`。
+如果前一轮只缺 v30 的 WY 数据，修正库路径后可在 v30 命令上加
+`--suite gdn --case '^gdn/wy/standalone$'`，并将输出名改成 `v30-wy.json`。
 
 请直接回传两个完整 JSON 文件及各自的 label。若有失败或卡住，一并回传日志中的最后一条 case 和首个错误。若做了 profiling，
 附对应 `op_summary` 的表头及慢项行。将 v24 JSON 拷进 v30 容器后，v30 命令也可加

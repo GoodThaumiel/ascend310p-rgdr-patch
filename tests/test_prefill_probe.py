@@ -63,3 +63,17 @@ class TestPrefillProbeTiming(unittest.TestCase):
         row = prefill_probe.compare_reports([current], {"cases": [reference]})[0]
         self.assertTrue(row["same_timing_method"])
         self.assertEqual(row["p50_ratio"], 2)
+
+
+class TestGdnBindingCoverage(unittest.TestCase):
+    def test_focused_wy_cannot_pass_with_missing_standalone_binding(self):
+        row = {
+            "name": "gdn/wy/standalone",
+            "comparison_key": "gdn/wy",
+            "status": "SKIPPED",
+        }
+        self.assertEqual(
+            prefill_probe.missing_gdn_bindings([row], focused=True), ["gdn/wy"]
+        )
+        row["status"] = "PASSED"
+        self.assertEqual(prefill_probe.missing_gdn_bindings([row], focused=True), [])
