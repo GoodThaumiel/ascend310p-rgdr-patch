@@ -247,27 +247,33 @@ def representative_output(torch, value):
     return results
 
 
-def time_op(torch, operation, warmup, iterations):
+def time_op(torch, operation, warmup, iterations, batch_size):
     for _ in range(warmup):
         operation()
     torch.npu.synchronize()
-    events = [
-        (torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True))
-        for _ in range(iterations)
-    ]
-    wall_start = time.perf_counter()
-    for start, stop in events:
-        start.record()
-        value = operation()
-        stop.record()
-    torch.npu.synchronize()
-    wall_us = (time.perf_counter() - wall_start) * 1e6 / iterations
-    times = sorted(start.elapsed_time(stop) * 1000 for start, stop in events)
+    # Some 310P images return 107006 from aclrtEventElapsedTime. Use
+    # the same host clock and synchronization boundary in both images.
+    batch_sizes = []
+    times = []
+    total_us = 0.0
+    for offset in range(0, iterations, batch_size):
+        launches = min(batch_size, iterations - offset)
+        start_ns = time.perf_counter_ns()
+        for _ in range(launches):
+            value = operation()
+        torch.npu.synchronize()
+        elapsed_us = (time.perf_counter_ns() - start_ns) / 1e3
+        total_us += elapsed_us
+        batch_sizes.append(launches)
+        times.append(elapsed_us / launches)
+    times.sort()
     return {
+        "source": "host_synchronized_batches",
+        "sample_batch_sizes": batch_sizes,
         "p50_us": statistics.median(times),
-        "p90_us": times[max(0, (9 * iterations + 9) // 10 - 1)],
+        "p90_us": times[(9 * len(times) + 9) // 10 - 1],
         "min_us": times[0],
-        "host_wall_us_per_call": wall_us,
+        "host_wall_us_per_call": total_us / iterations,
     }, value
 
 
@@ -309,7 +315,11 @@ class Probe:
                 row["fixture_sha256"] = fixture
                 row["inputs"] = [tensor_info(item, self.torch_npu) for item in inputs]
                 timing, output = time_op(
-                    self.torch, operation, self.args.warmup, self.args.iterations
+                    self.torch,
+                    operation,
+                    self.args.warmup,
+                    self.args.iterations,
+                    self.args.timing_batch_size,
                 )
                 row.update(
                     timing=timing, output=representative_output(self.torch, output)
@@ -324,6 +334,8 @@ class Probe:
                 row.update(
                     status="FAILED", error=str(error), traceback=traceback.format_exc()
                 )
+                first_line = str(error).partition("\n")[0]
+                print(f"  FAILED: {first_line}", flush=True)
         self.save()
 
     def topk(self):
@@ -685,11 +697,11 @@ class Probe:
                     "fixture_sha256": fingerprint(offsets),
                     "offsets": offsets,
                     "timing": {
+                        "source": "host_wall",
                         "p50_us": statistics.median(times),
                         "p90_us": times[(9 * len(times) + 9) // 10 - 1],
                         "min_us": times[0],
                     },
-                    "timing_source": "host_wall",
                 }
             )
             self.save()
@@ -782,13 +794,23 @@ def compare_reports(cases, reference):
         ]
         for old in candidates:
             same_fixture = row["fixture_sha256"] == old["fixture_sha256"]
+            current_source = row["timing"].get(
+                "source", row.get("timing_source", "npu_event")
+            )
+            reference_source = old["timing"].get(
+                "source", old.get("timing_source", "npu_event")
+            )
+            same_timing_method = current_source == reference_source and row[
+                "timing"
+            ].get("sample_batch_sizes") == old["timing"].get("sample_batch_sizes")
             result = {
                 "current": row["name"],
                 "reference": old["name"],
                 "same_fixture": same_fixture,
+                "same_timing_method": same_timing_method,
             }
             before = old["timing"]["p50_us"]
-            if same_fixture and before > 0:
+            if same_fixture and same_timing_method and before > 0:
                 result.update(
                     reference_p50_us=before,
                     current_p50_us=row["timing"]["p50_us"],
@@ -846,6 +868,12 @@ def parse_args(argv=None):
     parser.add_argument("--reference-json", type=Path)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=50)
+    parser.add_argument(
+        "--timing-batch-size",
+        type=int,
+        default=5,
+        help="launches per synchronized host timing sample",
+    )
     parser.add_argument("--expect-cann")
     parser.add_argument("--expect-vllm")
     parser.add_argument("--expect-vllm-ascend")
@@ -875,11 +903,12 @@ def parse_args(argv=None):
         args.device < 0
         or args.warmup < 0
         or args.iterations < 1
+        or args.timing_batch_size < 1
         or args.gmm_experts < 1
         or args.gmm_intermediate < 1
     ):
         parser.error(
-            "device and warmup must be nonnegative; iterations, expert count and intermediate width must be positive"
+            "device and warmup must be nonnegative; iterations, timing batch size, expert count and intermediate width must be positive"
         )
     if args.expect_cann and not CANN_RE.fullmatch(args.expect_cann):
         parser.error("--expect-cann must be a version such as 9.1.0-beta1 or 9.2.1")
@@ -896,14 +925,17 @@ def main(argv=None):
     args.output.parent.mkdir(parents=True, exist_ok=True)
     suites = args.suite or list(SUITES)
     report = {
-        "schema": 1,
+        "schema": 2,
         "label": args.label,
         "suites": suites,
         "seed": SEED,
         "warmup": args.warmup,
         "iterations": args.iterations,
-        "cases": [],
+        "timing_batch_size": args.timing_batch_size,
+        "environment": {},
+        "environment_checks": {},
         "suite_errors": {},
+        "cases": [],
     }
     try:
         import torch

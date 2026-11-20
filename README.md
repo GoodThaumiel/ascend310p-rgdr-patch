@@ -523,7 +523,11 @@ python3 -m ascend310p_rgdr_patch.prefill_probe --device 0 \
 `--expect-device 310P` 校验。期望值不匹配会写 JSON 后退出。若某个镜像的 release 值采用不同
 版本标记，先看 `environment_checks` 和 `toolkit_version_files`，据实调整校验值。
 
-默认运行以下对照。所有设备计时报告 NPU Event 的 p50/p90 和 host wall time。
+默认运行以下对照。两个镜像统一用 host 时钟计时，每批提交 5 次调用后同步一次，
+报告每批平均单次时延的 p50/p90，以及全部调用的平均 host wall time。
+`--iterations` 仍表示计时调用总数。可以用 `--timing-batch-size` 调整批大小，
+跨镜像时保持两个计时参数一致。由于旧镜像的 NPU Event 报过 `107006`，
+此探针的设备路径不调用 Event 计时。纯 kernel 的 Task Duration 以 `msprof` 为准。
 数据和权重从固定种子生成，计时前把输入拷到设备。可用 `--suite` 缩小范围，
 并用 `--case` 按正则筛选，方便对单项抓 `msprof`。
 
@@ -541,7 +545,7 @@ python3 -m ascend310p_rgdr_patch.prefill_probe --device 0 \
 TopK 选中分数差异，作为比较数据。只测一个阶段可执行
 `--suite gdn --case '^gdn/h/'`，只测原生 TopK 可执行 `--suite topk --case '^topk/1024x256/native$'`。
 
-请回传两个 JSON。若有失败或卡住，一并回传日志中的最后一条 case 和首个错误。若做了 profiling，
+请直接回传两个完整 JSON 文件及各自的 label。若有失败或卡住，一并回传日志中的最后一条 case 和首个错误。若做了 profiling，
 附对应 `op_summary` 的表头及慢项行。将 v24 JSON 拷进 v30 容器后，v30 命令也可加
 `--reference-json /absolute/path/to/v24.json`，在报告内比较相同输入指纹的 p50 和输出采样。
 跨镜像的差异对应整套运行栈，同栈的 H/O 两 binding 和 padding 消融可用于进一步归因。
