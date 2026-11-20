@@ -493,3 +493,55 @@ done
 回传 `rgdr_v310_l0c_<variant>` 的 Task Duration p50/p90、Vector、Scalar、MAC、
 MTE 和 Block Num。符号中的连字符换成下划线。完整 L0C rank-1 仍需确定原 state
 进入累加器的路径，本节先测可独立验证的布局和流水成本。
+
+## 310P prefill 跨镜像探针
+
+用同一 commit、同一张空闲卡分别在 v24（CANN 9.1.0 beta1）和 v30（CANN 9.2.1）容器运行。使用各自镜像的 CANN 设置和 Python。探针从源码运行，无需安装 RGDR patch、编译 RGDR 或启动服务。v30 的 WY 用当前镜像已构建的 compute WY 扩展。
+
+```bash
+# 在两个容器的 RGDR patch 仓库根目录分别执行
+git pull --ff-only
+export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
+RESULTS="$PWD/prefill-probe-results"
+mkdir -p "$RESULTS"
+set -o pipefail
+
+# 只在 v24 容器运行
+python3 -m ascend310p_rgdr_patch.prefill_probe --device 0 \
+  --label v24 --expect-cann 9.1.0-beta1 --expect-vllm-ascend 0.24.0 \
+  --output "$RESULTS/v24.json" 2>&1 | tee "$RESULTS/v24.log"
+
+# 只在 v30 容器运行，将库路径改为已通过 smoke 的实际路径
+export VLLM_ASCEND_310P_COMPUTE_WY_LIBRARY=/absolute/path/to/libreplayssm_310p_compute_wy.so
+python3 -m ascend310p_rgdr_patch.prefill_probe --device 0 \
+  --label v30 --expect-cann 9.2.1 --expect-vllm-ascend 0.30.0 \
+  --output "$RESULTS/v30.json" 2>&1 | tee "$RESULTS/v30.log"
+```
+
+只查环境时加 `--suite env`。探针报告 CANN Toolkit/OPP 路径、安装版本文件、进程实际映射的
+运行库、包版本与设备信息。可以再加 `--expect-torch-npu`、`--expect-vllm` 或
+`--expect-device 310P` 校验。期望值不匹配会写 JSON 后退出。若某个镜像的 release 值采用不同
+版本标记，先看 `environment_checks` 和 `toolkit_version_files`，据实调整校验值。
+
+默认运行以下对照。所有设备计时报告 NPU Event 的 p50/p90 和 host wall time。
+数据和权重从固定种子生成，计时前把输入拷到设备。可用 `--suite` 缩小范围，
+并用 `--case` 按正则筛选，方便对单项抓 `msprof`。
+
+| Suite | 对照 |
+| --- | --- |
+| `topk` | FP16 ND、256 experts、k=8，测 816/929/1024 行。比较原生、原生加重归一化、按 512 行切分、选中 logits 后 softmax。记录 CPU 参考的专家分数、重复 ID 和概率误差 |
+| `rmsnorm` | FP16 activation/gamma，宽度 128 按实测 shape 和相邻行数扫描，宽度 2048 做对照。31240 行单独测补齐到 16/32 倍数的路径，补齐和裁切计入时延 |
+| `gmm` | 同一量化输入、FRACTAL_NZ 权重、FP32 scale、INT64 累计组长。GMM1/GMM2 分开测原报告的 3888/4001 token，并比较均匀和倾斜的专家负载。默认 256 experts、rank 内 intermediate=256 |
+| `gdn` | 比较旧/新 Compute WY，分别测 FwdH、FwdO 和 H→O 链。H 的 post-WY 输入由 CPU 生成，单测 O 使用固定输入，两个 binding 使用相同字节。默认 4 条序列合计 4096 token，`--gdn-lengths` 可指定同一组实际长度 |
+| `metadata` | 对比 GDN `cu_seqlens` 从 NPU 转回 host 与直接使用 host tuple，仅记录 host wall time。单独测量空闲流上的固定开销 |
+
+如果 v30 已有兼容的旧 H/O Torch binding，可用 `--extra-library /absolute/path/to/legacy.so`
+在同一镜像里直接 A/B。镜像没有的 variant 会标记 `SKIPPED`。完整 GDN suite 要求 WY、H、O 各有
+至少一个可运行的 binding。结果中的 `PASSED` 表示调用成功且输出有限，`check` 字段提供误差和
+TopK 选中分数差异，作为比较数据。只测一个阶段可执行
+`--suite gdn --case '^gdn/h/'`，只测原生 TopK 可执行 `--suite topk --case '^topk/1024x256/native$'`。
+
+请回传两个 JSON。若有失败或卡住，一并回传日志中的最后一条 case 和首个错误。若做了 profiling，
+附对应 `op_summary` 的表头及慢项行。将 v24 JSON 拷进 v30 容器后，v30 命令也可加
+`--reference-json /absolute/path/to/v24.json`，在报告内比较相同输入指纹的 p50 和输出采样。
+跨镜像的差异对应整套运行栈，同栈的 H/O 两 binding 和 padding 消融可用于进一步归因。
